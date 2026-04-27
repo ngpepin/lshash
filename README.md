@@ -224,3 +224,23 @@ cd /home/npepin/Projects/lshash
   - `--dedupe`
   - `--dedup`
   - `-d`
+
+## Appendix A: Advantages of BLAKE3
+
+BLAKE3 is a modern cryptographic hash function and a strong default for file hashing workflows.
+
+- High speed: significantly faster than older hashes (such as SHA-256) on many systems, which helps when scanning large directories.
+- Efficient scaling: designed to use parallelism well, so it performs especially well on modern multi-core CPUs.
+- Strong security design: built from well-reviewed cryptographic components and intended for robust integrity checking.
+- Flexible output: supports extendable output mode (XOF), which allows generating more output bytes when needed for advanced uses.
+- Practical tooling: available via `b3sum`, making it easy to integrate into scripts and command-line workflows.
+
+For this project, BLAKE3 provides a good balance of speed and safety for differentiating files by content hash.
+
+### Quick comparison
+
+| Algorithm | Speed (typical) | Collision resistance for modern use | Security posture | Best fit in this project |
+| --- | --- | --- | --- | --- |
+| BLAKE3 | Very high | Strong | Modern cryptographic design | Default choice for fast, reliable file differentiation |
+| SHA-256 | Moderate | Strong | Widely standardized and trusted | Great compatibility fallback when BLAKE3 is unavailable |
+| MD5 | Very high | Weak | Not suitable for adversarial integrity checks | Non-security workflows where speed matters and collisions are acceptable |
