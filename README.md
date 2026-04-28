@@ -10,6 +10,7 @@ A Bash utility that lists files in alphabetical order and prints an aligned hash
 - Defaults to BLAKE3.
 - Can recurse into subdirectories.
 - Supports multiple exclusion patterns.
+- Ignores `.dups/` directories by default.
 - Highlights adjacent matching hashes in green.
 - Optional dedupe mode to keep one file and move duplicates into hidden `.dups/` directories.
 
@@ -55,6 +56,7 @@ If installation cannot be done automatically, the script exits with guidance.
   - Hash algorithm: `blake3`, `sha256`, `sha512`, `sha1`, `md5`, `blake2`
 - `-r`, `--recursive`
   - Include files in subdirectories
+  - Hidden `.dups/` directories are skipped by default
 - `-e PATTERN`
 - `--exclude PATTERN`
 - `--exclude=PATTERN`
@@ -64,6 +66,7 @@ If installation cannot be done automatically, the script exits with guidance.
   - Dedupe files with identical hash in the same directory
   - Modes: `newer`, `older`, `shorter`, `longer`
   - Default mode when omitted: `shorter`
+- One-letter short switches are stackable in any order (for example `-rd`, `-dr`, `-re '*.log'`).
 
 ## Output formatting
 

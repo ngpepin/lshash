@@ -99,66 +99,8 @@ get_file_mtime() {
   fi
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --algorithm=*)
-      algorithm="${1#--algorithm=}"
-      shift
-      ;;
-    --algorithm)
-      if [[ $# -lt 2 ]]; then
-        echo "Missing value for --algorithm" >&2
-        exit 1
-      fi
-      algorithm="$2"
-      shift 2
-      ;;
-    -r|--recursive)
-      recursive="true"
-      shift
-      ;;
-    --exclude=*)
-      exclude_patterns+=("${1#--exclude=}")
-      shift
-      ;;
-    --exclude)
-      if [[ $# -lt 2 ]]; then
-        echo "Missing value for --exclude" >&2
-        exit 1
-      fi
-      exclude_patterns+=("$2")
-      shift 2
-      ;;
-    -e)
-      if [[ $# -lt 2 ]]; then
-        echo "Missing value for -e" >&2
-        exit 1
-      fi
-      exclude_patterns+=("$2")
-      shift 2
-      ;;
-    -d=*)
-      dedupe_enabled="true"
-      dedupe_mode="${1#-d=}"
-      shift
-      ;;
-    --dedupe=*|--dedup=*|--dedub=*)
-      dedupe_enabled="true"
-      dedupe_mode="${1#*=}"
-      shift
-      ;;
-    -d|--dedupe|--dedup|--dedub)
-      dedupe_enabled="true"
-      if [[ $# -ge 2 && "$2" != -* ]]; then
-        dedupe_mode="$2"
-        shift 2
-      else
-        dedupe_mode="shorter"
-        shift
-      fi
-      ;;
-    -h|--help)
-      cat <<'EOF'
+print_help() {
+  cat <<'EOF'
 Usage: lshash.sh [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]]
 
 NAME can be one of:
@@ -174,6 +116,9 @@ Options:
   -d, --dedupe [MODE]        Dedupe files with same hash in each directory
       --dedupe=MODE          Keep one file by MODE, move others to .dups/
 
+Short-option stacking:
+  One-letter switches can be stacked in any order, for example: -rd, -dr, -re '*.log'.
+
 Examples:
   lshash.sh
   lshash.sh --algorithm=sha256
@@ -183,15 +128,130 @@ Examples:
   lshash.sh -d
   lshash.sh -r --dedupe newer
   lshash.sh --dedupe=longer
+  lshash.sh -dr newer
 EOF
+}
+
+args=("$@")
+arg_count=${#args[@]}
+arg_index=0
+
+while (( arg_index < arg_count )); do
+  arg="${args[$arg_index]}"
+
+  case "$arg" in
+    --algorithm=*)
+      algorithm="${arg#--algorithm=}"
+      ;;
+    --algorithm)
+      if (( arg_index + 1 >= arg_count )); then
+        echo "Missing value for --algorithm" >&2
+        exit 1
+      fi
+      arg_index=$((arg_index + 1))
+      algorithm="${args[$arg_index]}"
+      ;;
+    --exclude=*)
+      exclude_patterns+=("${arg#--exclude=}")
+      ;;
+    --exclude)
+      if (( arg_index + 1 >= arg_count )); then
+        echo "Missing value for --exclude" >&2
+        exit 1
+      fi
+      arg_index=$((arg_index + 1))
+      exclude_patterns+=("${args[$arg_index]}")
+      ;;
+    --dedupe=*|--dedup=*|--dedub=*)
+      dedupe_enabled="true"
+      dedupe_mode="${arg#*=}"
+      ;;
+    --dedupe|--dedup|--dedub)
+      dedupe_enabled="true"
+      if (( arg_index + 1 < arg_count )) && [[ "${args[$((arg_index + 1))]}" != -* ]]; then
+        arg_index=$((arg_index + 1))
+        dedupe_mode="${args[$arg_index]}"
+      else
+        dedupe_mode="shorter"
+      fi
+      ;;
+    -h|--help)
+      print_help
       exit 0
       ;;
+    -*)
+      cluster="${arg#-}"
+      cluster_len=${#cluster}
+      cluster_pos=0
+      d_mode_pending="false"
+
+      while (( cluster_pos < cluster_len )); do
+        opt="${cluster:cluster_pos:1}"
+        case "$opt" in
+          r)
+            recursive="true"
+            cluster_pos=$((cluster_pos + 1))
+            ;;
+          h)
+            print_help
+            exit 0
+            ;;
+          e)
+            exclude_patterns+=("")
+            if (( cluster_pos + 1 < cluster_len )); then
+              exclude_patterns[$(( ${#exclude_patterns[@]} - 1 ))]="${cluster:$((cluster_pos + 1))}"
+              cluster_pos=$cluster_len
+            else
+              if (( arg_index + 1 >= arg_count )); then
+                echo "Missing value for -e" >&2
+                exit 1
+              fi
+              arg_index=$((arg_index + 1))
+              exclude_patterns[$(( ${#exclude_patterns[@]} - 1 ))]="${args[$arg_index]}"
+              cluster_pos=$cluster_len
+            fi
+            ;;
+          d)
+            dedupe_enabled="true"
+            remainder="${cluster:$((cluster_pos + 1))}"
+
+            if [[ -n "$remainder" ]]; then
+              if [[ "$remainder" == =* ]]; then
+                dedupe_mode="${remainder#=}" 
+                cluster_pos=$cluster_len
+              elif [[ "$remainder" =~ ^[rhed]+$ ]]; then
+                d_mode_pending="true"
+                cluster_pos=$((cluster_pos + 1))
+              else
+                dedupe_mode="$remainder"
+                cluster_pos=$cluster_len
+              fi
+            else
+              d_mode_pending="true"
+              cluster_pos=$((cluster_pos + 1))
+            fi
+            ;;
+          *)
+            echo "Unknown option: -$opt" >&2
+            echo "Try: --help" >&2
+            exit 1
+            ;;
+        esac
+      done
+
+      if [[ "$d_mode_pending" == "true" ]] && (( arg_index + 1 < arg_count )) && [[ "${args[$((arg_index + 1))]}" != -* ]]; then
+        arg_index=$((arg_index + 1))
+        dedupe_mode="${args[$arg_index]}"
+      fi
+      ;;
     *)
-      echo "Unknown option: $1" >&2
+      echo "Unknown option: $arg" >&2
       echo "Try: --help" >&2
       exit 1
       ;;
   esac
+
+  arg_index=$((arg_index + 1))
 done
 
 algorithm=$(printf '%s' "$algorithm" | tr '[:upper:]' '[:lower:]')
@@ -251,9 +311,9 @@ fi
 
 # Collect regular files and sort by name/path.
 if [[ "$recursive" == "true" ]]; then
-  mapfile -d '' files < <(find . -type f -printf '%P\0' | LC_ALL=C sort -z)
+  mapfile -d '' files < <(find . -type d -name .dups -prune -o -type f -printf '%P\0' | LC_ALL=C sort -z)
 else
-  mapfile -d '' files < <(find . -maxdepth 1 -type f -printf '%P\0' | LC_ALL=C sort -z)
+  mapfile -d '' files < <(find . -maxdepth 1 -type d -name .dups -prune -o -type f -printf '%P\0' | LC_ALL=C sort -z)
 fi
 
 if [[ ${#exclude_patterns[@]} -gt 0 ]]; then
