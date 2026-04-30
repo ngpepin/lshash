@@ -39,6 +39,12 @@ internal sealed class Options
     public DedupeMode DedupeMode { get; set; } = DedupeMode.Shorter;
 
     public bool ShowHelp { get; set; }
+
+    public bool Quiet { get; set; }
+
+    public bool AllDirectoryDedupe { get; set; }
+
+    public string RootDirectory { get; set; } = ".";
 }
 
 internal sealed class FileEntry
@@ -49,11 +55,26 @@ internal sealed class FileEntry
 
     public required string BaseName { get; init; }
 
-    public required string Hash { get; init; }
+    public string? Hash { get; init; }
 
-    public required long MtimeSeconds { get; init; }
+    public bool HashAvailable { get; init; }
+
+    public long MtimeSeconds { get; init; }
+
+    public bool MtimeAvailable { get; init; }
 
     public bool Moved { get; set; }
+}
+
+internal sealed class SummaryStats
+{
+    public long TotalFilesScanned { get; set; }
+
+    public long DuplicateFilesFound { get; set; }
+
+    public long DuplicateFilesMoved { get; set; }
+
+    public long DirectoriesTraversed { get; set; }
 }
 
 internal static class Program
@@ -62,7 +83,7 @@ internal static class Program
     private const string Italic = "\u001b[3m";
     private const string Reset = "\u001b[0m";
 
-    private static readonly string WorkingDirectory = Directory.GetCurrentDirectory();
+    private static string WorkingDirectory = Directory.GetCurrentDirectory();
 
     private static int Main(string[] args)
     {
@@ -75,24 +96,20 @@ internal static class Program
                 return 0;
             }
 
-            var files = DiscoverFiles(options.Recursive);
-            if (options.ExcludePatterns.Count > 0)
+            WorkingDirectory = ResolveWorkingDirectory(options.RootDirectory);
+            var summaryStats = new SummaryStats();
+
+            if (options.Recursive)
             {
-                files = files.Where(path => !options.ExcludePatterns.Any(pattern => GlobMatch(path, pattern))).ToList();
+                ProcessRecursive(options, summaryStats);
+            }
+            else
+            {
+                ProcessSingleDirectory(".", options, summaryStats);
             }
 
-            if (files.Count == 0)
-            {
-                return 0;
-            }
+            PrintSummary(options, summaryStats);
 
-            if (!options.DedupeEnabled)
-            {
-                PrintNonDedupe(files, options.Algorithm);
-                return 0;
-            }
-
-            PrintWithDedupe(files, options.Algorithm, options.DedupeMode);
             return 0;
         }
         catch (ArgumentException ex)
@@ -143,6 +160,18 @@ internal static class Program
                     continue;
                 }
 
+                if (arg == "--quiet")
+                {
+                    options.Quiet = true;
+                    continue;
+                }
+
+                if (arg == "--all-directory")
+                {
+                    options.AllDirectoryDedupe = true;
+                    continue;
+                }
+
                 if (arg.StartsWith("--exclude=", StringComparison.Ordinal))
                 {
                     options.ExcludePatterns.Add(arg[10..]);
@@ -170,10 +199,12 @@ internal static class Program
                     options.DedupeEnabled = true;
                     options.DedupeMode = DedupeMode.Shorter;
 
-                    if (argIndex + 1 < args.Length && !args[argIndex + 1].StartsWith("-", StringComparison.Ordinal))
+                    if (argIndex + 1 < args.Length
+                        && !args[argIndex + 1].StartsWith("-", StringComparison.Ordinal)
+                        && TryParseDedupeMode(args[argIndex + 1], out var dedupeMode))
                     {
                         argIndex++;
-                        options.DedupeMode = ParseDedupeMode(args[argIndex]);
+                        options.DedupeMode = dedupeMode;
                     }
 
                     continue;
@@ -188,7 +219,13 @@ internal static class Program
                 continue;
             }
 
-            throw new ArgumentException($"Unknown option: {arg}");
+            if (options.RootDirectory == ".")
+            {
+                options.RootDirectory = arg;
+                continue;
+            }
+
+            throw new ArgumentException($"Unexpected argument: {arg}");
         }
 
         return options;
@@ -206,6 +243,10 @@ internal static class Program
             {
                 case 'r':
                     options.Recursive = true;
+                    clusterPos++;
+                    break;
+                case 'q':
+                    options.Quiet = true;
                     clusterPos++;
                     break;
                 case 'h':
@@ -249,7 +290,7 @@ internal static class Program
                         break;
                     }
 
-                    if (Regex.IsMatch(remainder, "^[rhed]+$", RegexOptions.CultureInvariant))
+                    if (Regex.IsMatch(remainder, "^[rhedq]+$", RegexOptions.CultureInvariant))
                     {
                         dedupeModePending = true;
                         clusterPos++;
@@ -267,10 +308,11 @@ internal static class Program
 
         if (dedupeModePending
             && argIndex + 1 < args.Length
-            && !args[argIndex + 1].StartsWith("-", StringComparison.Ordinal))
+            && !args[argIndex + 1].StartsWith("-", StringComparison.Ordinal)
+            && TryParseDedupeMode(args[argIndex + 1], out var dedupeMode))
         {
             argIndex++;
-            options.DedupeMode = ParseDedupeMode(args[argIndex]);
+            options.DedupeMode = dedupeMode;
         }
     }
 
@@ -315,11 +357,44 @@ internal static class Program
         };
     }
 
+    private static bool TryParseDedupeMode(string value, out DedupeMode mode)
+    {
+        switch (value.Trim().ToLowerInvariant())
+        {
+            case "newer":
+                mode = DedupeMode.Newer;
+                return true;
+            case "older":
+                mode = DedupeMode.Older;
+                return true;
+            case "shorter":
+                mode = DedupeMode.Shorter;
+                return true;
+            case "longer":
+                mode = DedupeMode.Longer;
+                return true;
+            default:
+                mode = DedupeMode.Shorter;
+                return false;
+        }
+    }
+
+    private static string ResolveWorkingDirectory(string rootDirectory)
+    {
+        var resolved = Path.GetFullPath(rootDirectory);
+        if (!Directory.Exists(resolved))
+        {
+            throw new ArgumentException($"Cannot access directory: {rootDirectory}");
+        }
+
+        return resolved;
+    }
+
     private static void PrintHelp()
     {
         Console.WriteLine(
             """
-            Usage: lshash [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]]
+            Usage: lshash [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [-q|--quiet] [DIRECTORY]
 
             NAME can be one of:
               blake3, sha256, sha512, sha1, md5, blake2
@@ -333,6 +408,8 @@ internal static class Program
                   --exclude=PATTERN      Exclude files matching PATTERN (repeatable)
               -d, --dedupe [MODE]        Dedupe files with same hash in each directory
                   --dedupe=MODE          Keep one file by MODE, move others to .dups/
+              --all-directory            With -d, dedupe using all files in directory by hash (ignores filename adjacency)
+              -q, --quiet                Only print duplicate (green) file lines
 
             Short-option stacking:
               One-letter switches can be stacked in any order, for example: -rd, -dr, -re '*.log'.
@@ -345,141 +422,168 @@ internal static class Program
               lshash --algorithm=sha512 --exclude='build/*' --exclude='*.bak'
               lshash -d
               lshash -r --dedupe newer
+              lshash -d --all-directory
               lshash --dedupe=longer
               lshash -dr newer
+              lshash -rq /path/to/scan
             """
         );
     }
 
-    private static List<string> DiscoverFiles(bool recursive)
+    private static void ProcessRecursive(Options options, SummaryStats summaryStats)
     {
-        var results = new List<string>();
-
-        if (!recursive)
+        var previousHash = string.Empty;
+        foreach (var directory in EnumerateDirectoriesDepthFirst())
         {
-            foreach (var file in Directory.EnumerateFiles(WorkingDirectory, "*", SearchOption.TopDirectoryOnly))
-            {
-                results.Add(ToUnixRelativePath(file));
-            }
-
-            results.Sort(StringComparer.Ordinal);
-            return results;
+            summaryStats.DirectoriesTraversed++;
+            ProcessDirectory(directory, options, summaryStats, ref previousHash);
         }
-
-        var pendingDirs = new Stack<string>();
-        pendingDirs.Push(WorkingDirectory);
-
-        while (pendingDirs.Count > 0)
-        {
-            var dir = pendingDirs.Pop();
-
-            foreach (var subDir in Directory.EnumerateDirectories(dir))
-            {
-                if (string.Equals(Path.GetFileName(subDir), ".dups", StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                pendingDirs.Push(subDir);
-            }
-
-            foreach (var file in Directory.EnumerateFiles(dir, "*", SearchOption.TopDirectoryOnly))
-            {
-                results.Add(ToUnixRelativePath(file));
-            }
-        }
-
-        results.Sort(StringComparer.Ordinal);
-        return results;
     }
 
-    private static void PrintNonDedupe(List<string> files, HashAlgorithmKind algorithm)
+    private static void ProcessSingleDirectory(string directory, Options options, SummaryStats summaryStats)
+    {
+        var previousHash = string.Empty;
+        ProcessDirectory(directory, options, summaryStats, ref previousHash);
+    }
+
+    private static void ProcessDirectory(string directory, Options options, SummaryStats summaryStats, ref string previousHash)
+    {
+        var files = GetFilesForDirectory(directory);
+        if (options.ExcludePatterns.Count > 0)
+        {
+            files = files.Where(path => !options.ExcludePatterns.Any(pattern => GlobMatch(path, pattern))).ToList();
+        }
+
+        summaryStats.TotalFilesScanned += files.Count;
+
+        if (files.Count == 0)
+        {
+            return;
+        }
+
+        if (options.DedupeEnabled)
+        {
+            previousHash = PrintWithDedupe(files, options.Algorithm, options.DedupeMode, options.Quiet, options.AllDirectoryDedupe, summaryStats, previousHash);
+        }
+        else
+        {
+            previousHash = PrintNonDedupe(files, options.Algorithm, options.Quiet, summaryStats, previousHash);
+        }
+    }
+
+    private static IEnumerable<string> EnumerateDirectoriesDepthFirst()
+    {
+        var stack = new Stack<string>();
+        stack.Push(".");
+
+        while (stack.Count > 0)
+        {
+            var dir = stack.Pop();
+            yield return dir;
+
+            var absoluteDir = dir == "." ? WorkingDirectory : GetAbsolutePath(dir);
+            var subDirs = Directory
+                .EnumerateDirectories(absoluteDir)
+                .Where(path => !string.Equals(Path.GetFileName(path), ".dups", StringComparison.Ordinal))
+                .Select(path => Path.GetFileName(path))
+                .OrderBy(name => name, StringComparer.Ordinal)
+                .ToList();
+
+            for (var i = subDirs.Count - 1; i >= 0; i--)
+            {
+                var child = subDirs[i];
+                stack.Push(dir == "." ? child : $"{dir}/{child}");
+            }
+        }
+    }
+
+    private static List<string> GetFilesForDirectory(string directory)
+    {
+        var absoluteDir = directory == "." ? WorkingDirectory : GetAbsolutePath(directory);
+        var files = new List<string>();
+
+        foreach (var file in Directory.EnumerateFiles(absoluteDir, "*", SearchOption.TopDirectoryOnly))
+        {
+            files.Add(ToUnixRelativePath(file));
+        }
+
+        files.Sort(StringComparer.Ordinal);
+        return files;
+    }
+
+    private static string PrintNonDedupe(List<string> files, HashAlgorithmKind algorithm, bool quiet, SummaryStats summaryStats, string previousHash)
     {
         var maxNameLen = files.Max(path => path.Length);
-        var previousHash = string.Empty;
 
         foreach (var file in files)
         {
-            var hash = ComputeHash(file, algorithm);
-            var displayHash = previousHash.Length > 0 && hash == previousHash
-                ? $"{Green}{hash}{Reset}"
-                : hash;
-
-            Console.WriteLine($"{file.PadRight(maxNameLen)}  {displayHash}");
-            previousHash = hash;
-        }
-    }
-
-    private static void PrintWithDedupe(List<string> files, HashAlgorithmKind algorithm, DedupeMode dedupeMode)
-    {
-        var entries = files.Select(file => new FileEntry
-        {
-            RelativePath = file,
-            DirectoryPath = GetDirectoryPath(file),
-            BaseName = Path.GetFileName(file),
-            Hash = ComputeHash(file, algorithm),
-            MtimeSeconds = GetMtimeSeconds(file),
-            Moved = false,
-        }).ToList();
-
-        var groups = new Dictionary<string, List<int>>(StringComparer.Ordinal);
-        for (var i = 0; i < entries.Count; i++)
-        {
-            var key = $"{entries[i].DirectoryPath}|{entries[i].Hash}";
-            if (!groups.TryGetValue(key, out var indices))
+            if (!TryComputeHash(file, algorithm, out var hash) || hash is null)
             {
-                indices = new List<int>();
-                groups[key] = indices;
-            }
+                if (!quiet)
+                {
+                    Console.WriteLine($"{file.PadRight(maxNameLen)}  <hash unavailable>");
+                }
 
-            indices.Add(i);
-        }
-
-        foreach (var indices in groups.Values)
-        {
-            if (indices.Count < 2)
-            {
                 continue;
             }
 
-            var keepIndex = indices[0];
-            for (var i = 1; i < indices.Count; i++)
+            var isDuplicate = previousHash.Length > 0 && hash == previousHash;
+            if (isDuplicate)
             {
-                var candidateIndex = indices[i];
-                if (ShouldReplace(entries[candidateIndex], entries[keepIndex], dedupeMode))
-                {
-                    keepIndex = candidateIndex;
-                }
+                summaryStats.DuplicateFilesFound++;
             }
 
-            foreach (var index in indices)
-            {
-                if (index == keepIndex)
-                {
-                    continue;
-                }
+            var displayHash = isDuplicate ? $"{Green}{hash}{Reset}" : hash;
 
-                MoveToDups(entries[index]);
-                entries[index].Moved = true;
+            if (!quiet || isDuplicate)
+            {
+                Console.WriteLine($"{file.PadRight(maxNameLen)}  {displayHash}");
             }
+
+            previousHash = hash;
         }
 
-        var displayNames = entries
-            .Select(entry => entry.Moved ? $"{entry.RelativePath} (moved to .dups/)" : entry.RelativePath)
-            .ToList();
+        return previousHash;
+    }
 
-        var maxNameLen = displayNames.Max(name => name.Length);
-        var previousHash = string.Empty;
+    private static string PrintWithDedupe(List<string> files, HashAlgorithmKind algorithm, DedupeMode dedupeMode, bool quiet, bool allDirectoryDedupe, SummaryStats summaryStats, string previousHash)
+    {
+        const string movedSuffix = " (moved to .dups/)";
+        var maxNameLen = files.Max(path => path.Length + movedSuffix.Length);
 
-        for (var i = 0; i < entries.Count; i++)
+        var runActive = false;
+        var runHash = string.Empty;
+        var runEntries = new List<FileEntry>();
+
+        void PrintEntry(FileEntry entry)
         {
-            var hash = entries[i].Hash;
-            var displayHash = previousHash.Length > 0 && hash == previousHash
-                ? $"{Green}{hash}{Reset}"
-                : hash;
+            string displayHash;
+            var isDuplicate = false;
+            if (entry.HashAvailable && entry.Hash is not null)
+            {
+                isDuplicate = previousHash.Length > 0 && entry.Hash == previousHash;
+                if (isDuplicate)
+                {
+                    summaryStats.DuplicateFilesFound++;
+                }
 
-            var displayName = displayNames[i].PadRight(maxNameLen);
-            if (entries[i].Moved)
+                displayHash = isDuplicate ? $"{Green}{entry.Hash}{Reset}" : entry.Hash;
+                previousHash = entry.Hash;
+            }
+            else
+            {
+                displayHash = "<hash unavailable>";
+            }
+
+            if (quiet && !isDuplicate)
+            {
+                return;
+            }
+
+            var displayName = entry.Moved ? entry.RelativePath + movedSuffix : entry.RelativePath;
+            displayName = displayName.PadRight(maxNameLen);
+
+            if (entry.Moved)
             {
                 Console.WriteLine($"{Italic}{displayName}{Reset}  {displayHash}");
             }
@@ -487,58 +591,302 @@ internal static class Program
             {
                 Console.WriteLine($"{displayName}  {displayHash}");
             }
-
-            previousHash = hash;
         }
+
+        void FlushRun()
+        {
+            if (!runActive)
+            {
+                return;
+            }
+
+            var hashableIndices = runEntries
+                .Select((entry, index) => (entry, index))
+                .Where(tuple => tuple.entry.HashAvailable)
+                .Select(tuple => tuple.index)
+                .ToList();
+
+            if (hashableIndices.Count >= 2)
+            {
+                var keepIndex = hashableIndices[0];
+                for (var i = 1; i < hashableIndices.Count; i++)
+                {
+                    var candidateIndex = hashableIndices[i];
+                    if (ShouldReplace(runEntries[candidateIndex], runEntries[keepIndex], dedupeMode))
+                    {
+                        keepIndex = candidateIndex;
+                    }
+                }
+
+                foreach (var index in hashableIndices)
+                {
+                    if (index == keepIndex)
+                    {
+                        continue;
+                    }
+
+                    if (TryMoveToDups(runEntries[index]))
+                    {
+                        runEntries[index].Moved = true;
+                        summaryStats.DuplicateFilesMoved++;
+                    }
+                }
+            }
+
+            foreach (var entry in runEntries)
+            {
+                PrintEntry(entry);
+            }
+
+            runEntries.Clear();
+            runActive = false;
+            runHash = string.Empty;
+        }
+
+        void ApplyAllDirectoryDedupe(List<FileEntry> entries)
+        {
+            var groups = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var entry = entries[i];
+                if (!entry.HashAvailable || entry.Hash is null)
+                {
+                    continue;
+                }
+
+                if (!groups.TryGetValue(entry.Hash, out var indices))
+                {
+                    indices = new List<int>();
+                    groups[entry.Hash] = indices;
+                }
+
+                indices.Add(i);
+            }
+
+            foreach (var indices in groups.Values)
+            {
+                if (indices.Count < 2)
+                {
+                    continue;
+                }
+
+                var keepIndex = indices[0];
+                for (var i = 1; i < indices.Count; i++)
+                {
+                    var candidateIndex = indices[i];
+                    if (ShouldReplace(entries[candidateIndex], entries[keepIndex], dedupeMode))
+                    {
+                        keepIndex = candidateIndex;
+                    }
+                }
+
+                foreach (var index in indices)
+                {
+                    if (index == keepIndex)
+                    {
+                        continue;
+                    }
+
+                    if (TryMoveToDups(entries[index]))
+                    {
+                        entries[index].Moved = true;
+                        summaryStats.DuplicateFilesMoved++;
+                    }
+                }
+            }
+        }
+
+        if (allDirectoryDedupe)
+        {
+            var entries = files.Select(file => BuildEntry(file, algorithm)).ToList();
+            ApplyAllDirectoryDedupe(entries);
+
+            foreach (var entry in entries)
+            {
+                PrintEntry(entry);
+            }
+
+            return previousHash;
+        }
+
+        foreach (var file in files)
+        {
+            var entry = BuildEntry(file, algorithm);
+
+            if (!runActive)
+            {
+                if (!entry.HashAvailable)
+                {
+                    PrintEntry(entry);
+                    continue;
+                }
+
+                runActive = true;
+                runHash = entry.Hash!;
+                runEntries.Add(entry);
+                continue;
+            }
+
+            if (!entry.HashAvailable)
+            {
+                runEntries.Add(entry);
+                continue;
+            }
+
+            if (entry.Hash == runHash)
+            {
+                runEntries.Add(entry);
+                continue;
+            }
+
+            FlushRun();
+
+            runActive = true;
+            runHash = entry.Hash!;
+            runEntries.Add(entry);
+        }
+
+        FlushRun();
+
+        return previousHash;
+    }
+
+    private static void PrintSummary(Options options, SummaryStats summaryStats)
+    {
+        var duplicatesReported = options.DedupeEnabled ? summaryStats.DuplicateFilesMoved : summaryStats.DuplicateFilesFound;
+        var duplicatePhrase = options.DedupeEnabled ? "were found and moved" : "were found";
+        var duplicatePercent = FormatPercent(duplicatesReported, summaryStats.TotalFilesScanned);
+
+        if (options.Recursive)
+        {
+            Console.WriteLine(
+                $"Summary: scanned {summaryStats.TotalFilesScanned} file(s); {duplicatesReported} duplicate file(s) {duplicatePhrase} ({duplicatePercent}% of scanned files); {summaryStats.DirectoriesTraversed} directories were traversed."
+            );
+            return;
+        }
+
+        Console.WriteLine(
+            $"Summary: scanned {summaryStats.TotalFilesScanned} file(s); {duplicatesReported} duplicate file(s) {duplicatePhrase} ({duplicatePercent}% of scanned files)."
+        );
+    }
+
+    private static string FormatPercent(long numerator, long denominator)
+    {
+        if (denominator <= 0)
+        {
+            return "0.00";
+        }
+
+        var basisPoints = numerator * 10000 / denominator;
+        return FormattableString.Invariant($"{basisPoints / 100}.{basisPoints % 100:00}");
+    }
+
+    private static FileEntry BuildEntry(string file, HashAlgorithmKind algorithm)
+    {
+        var hashAvailable = TryComputeHash(file, algorithm, out var hash);
+        var mtimeAvailable = TryGetMtimeSeconds(file, out var mtime);
+
+        return new FileEntry
+        {
+            RelativePath = file,
+            DirectoryPath = GetDirectoryPath(file),
+            BaseName = Path.GetFileName(file) ?? file,
+            Hash = hash,
+            HashAvailable = hashAvailable,
+            MtimeSeconds = mtimeAvailable ? mtime : 0,
+            MtimeAvailable = mtimeAvailable,
+            Moved = false,
+        };
     }
 
     private static bool ShouldReplace(FileEntry candidate, FileEntry current, DedupeMode mode)
     {
         return mode switch
         {
-            DedupeMode.Newer => candidate.MtimeSeconds > current.MtimeSeconds,
-            DedupeMode.Older => candidate.MtimeSeconds < current.MtimeSeconds,
+            DedupeMode.Newer => candidate.MtimeAvailable && (!current.MtimeAvailable || candidate.MtimeSeconds > current.MtimeSeconds),
+            DedupeMode.Older => candidate.MtimeAvailable && (!current.MtimeAvailable || candidate.MtimeSeconds < current.MtimeSeconds),
             DedupeMode.Shorter => candidate.BaseName.Length < current.BaseName.Length,
             DedupeMode.Longer => candidate.BaseName.Length > current.BaseName.Length,
             _ => false,
         };
     }
 
-    private static void MoveToDups(FileEntry entry)
+    private static bool TryMoveToDups(FileEntry entry)
     {
-        var sourcePath = GetAbsolutePath(entry.RelativePath);
-        var dupsDirRel = entry.DirectoryPath == "." ? ".dups" : $"{entry.DirectoryPath}/.dups";
-        var dupsDirAbs = GetAbsolutePath(dupsDirRel);
-        Directory.CreateDirectory(dupsDirAbs);
-
-        var targetPath = Path.Combine(dupsDirAbs, entry.BaseName);
-        if (File.Exists(targetPath))
+        try
         {
-            var suffix = 1;
-            while (File.Exists(Path.Combine(dupsDirAbs, $"{entry.BaseName}.dup{suffix}")))
+            var sourcePath = GetAbsolutePath(entry.RelativePath);
+            var dupsDirRel = entry.DirectoryPath == "." ? ".dups" : $"{entry.DirectoryPath}/.dups";
+            var dupsDirAbs = GetAbsolutePath(dupsDirRel);
+            Directory.CreateDirectory(dupsDirAbs);
+
+            var targetPath = Path.Combine(dupsDirAbs, entry.BaseName);
+            if (File.Exists(targetPath))
             {
-                suffix++;
+                var suffix = 1;
+                while (File.Exists(Path.Combine(dupsDirAbs, $"{entry.BaseName}.dup{suffix}")))
+                {
+                    suffix++;
+                }
+
+                targetPath = Path.Combine(dupsDirAbs, $"{entry.BaseName}.dup{suffix}");
             }
 
-            targetPath = Path.Combine(dupsDirAbs, $"{entry.BaseName}.dup{suffix}");
+            File.Move(sourcePath, targetPath);
+            return true;
         }
-
-        File.Move(sourcePath, targetPath);
+        catch (Exception ex)
+        {
+            Warn("move", entry.RelativePath, ex.Message);
+            return false;
+        }
     }
 
-    private static string ComputeHash(string relativePath, HashAlgorithmKind algorithm)
+    private static bool TryComputeHash(string relativePath, HashAlgorithmKind algorithm, out string? hash)
     {
-        var absolutePath = GetAbsolutePath(relativePath);
-        return algorithm switch
+        try
         {
-            HashAlgorithmKind.Blake3 => ComputeBlake3(absolutePath),
-            HashAlgorithmKind.Sha256 => ComputeSystemHash(absolutePath, SHA256.Create()),
-            HashAlgorithmKind.Sha512 => ComputeSystemHash(absolutePath, SHA512.Create()),
-            HashAlgorithmKind.Sha1 => ComputeSystemHash(absolutePath, SHA1.Create()),
-            HashAlgorithmKind.Md5 => ComputeSystemHash(absolutePath, MD5.Create()),
-            HashAlgorithmKind.Blake2 => ComputeBlake2b512(absolutePath),
-            _ => throw new InvalidOperationException("Unsupported hash algorithm."),
-        };
+            var absolutePath = GetAbsolutePath(relativePath);
+            hash = algorithm switch
+            {
+                HashAlgorithmKind.Blake3 => ComputeBlake3(absolutePath),
+                HashAlgorithmKind.Sha256 => ComputeSystemHash(absolutePath, SHA256.Create()),
+                HashAlgorithmKind.Sha512 => ComputeSystemHash(absolutePath, SHA512.Create()),
+                HashAlgorithmKind.Sha1 => ComputeSystemHash(absolutePath, SHA1.Create()),
+                HashAlgorithmKind.Md5 => ComputeSystemHash(absolutePath, MD5.Create()),
+                HashAlgorithmKind.Blake2 => ComputeBlake2b512(absolutePath),
+                _ => throw new InvalidOperationException("Unsupported hash algorithm."),
+            };
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Warn("hash", relativePath, ex.Message);
+            hash = null;
+            return false;
+        }
+    }
+
+    private static bool TryGetMtimeSeconds(string relativePath, out long mtimeSeconds)
+    {
+        try
+        {
+            var absolutePath = GetAbsolutePath(relativePath);
+            mtimeSeconds = new DateTimeOffset(File.GetLastWriteTimeUtc(absolutePath)).ToUnixTimeSeconds();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Warn("read mtime", relativePath, ex.Message);
+            mtimeSeconds = 0;
+            return false;
+        }
+    }
+
+    private static void Warn(string action, string path, string details)
+    {
+        Console.Error.WriteLine($"Warning: cannot {action} '{path}': {details}");
     }
 
     private static string ComputeSystemHash(string filePath, HashAlgorithm algorithm)
@@ -605,12 +953,6 @@ internal static class Program
         var output = new byte[digest.GetDigestSize()];
         digest.DoFinal(output, 0);
         return Convert.ToHexString(output).ToLowerInvariant();
-    }
-
-    private static long GetMtimeSeconds(string relativePath)
-    {
-        var absolutePath = GetAbsolutePath(relativePath);
-        return new DateTimeOffset(File.GetLastWriteTimeUtc(absolutePath)).ToUnixTimeSeconds();
     }
 
     private static string GetDirectoryPath(string relativePath)
