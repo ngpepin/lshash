@@ -12,4 +12,11 @@
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.4.0" />
     <PackageReference Include="Blake3" Version="2.2.1" />
   </ItemGroup>
+
+  <ItemGroup>
+    <None Include="vendor/libblake3gpu.so">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
 </Project>

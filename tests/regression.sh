@@ -120,6 +120,22 @@ setup_all_directory_non_adjacent() {
   printf 'same\n' > "$root/z-sync-conflict.txt"
 }
 
+setup_symlink_directory() {
+  local root="$1"
+  mkdir -p "$root/real/sub"
+  printf 'x\n' > "$root/real/a.txt"
+  printf 'y\n' > "$root/real/sub/b.txt"
+  ln -s real "$root/linkdir"
+}
+
+setup_inaccessible_subdirectory() {
+  local root="$1"
+  mkdir -p "$root/open" "$root/blocked"
+  printf 'visible\n' > "$root/open/a.txt"
+  printf 'hidden\n' > "$root/blocked/secret.txt"
+  chmod 000 "$root/blocked"
+}
+
 main() {
   ensure_dotnet_binary
 
@@ -183,6 +199,17 @@ main() {
   assert_contains "$case_dir/bash.clean" "z-sync-conflict.txt (moved to .dups/)" "--all-directory with -d should dedupe non-adjacent duplicates"
   [[ -f "$case_dir/bashcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: bash --all-directory with -d should move duplicate" >&2; exit 1; }
   [[ -f "$case_dir/dotnetcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: dotnet --all-directory with -d should move duplicate" >&2; exit 1; }
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "recursive ignores symlink directories" setup_symlink_directory --algorithm=sha256 -r)"
+  assert_not_contains "$case_dir/bash.clean" "linkdir/" "recursive traversal should ignore symlinked directories"
+  assert_contains "$case_dir/bash.clean" "Summary: scanned 2 file(s); 0 duplicate file(s) were found (0.00% of scanned files); 3 directories were traversed." "recursive summary should not count symlinked directory targets"
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "recursive inaccessible subdirectory" setup_inaccessible_subdirectory --algorithm=sha256 -r)"
+  assert_contains "$case_dir/bash.clean" "open/a.txt" "recursive traversal should continue processing accessible directories"
+  assert_contains "$case_dir/bash.clean" "Summary: scanned" "recursive traversal should still emit summary when a subdirectory is inaccessible"
+  chmod 755 "$case_dir/bashcase/blocked" "$case_dir/dotnetcase/blocked" || true
   rm -rf "$case_dir"
 
   echo "All regression checks passed."

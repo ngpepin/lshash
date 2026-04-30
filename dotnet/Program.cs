@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -77,13 +78,90 @@ internal sealed class SummaryStats
     public long DirectoriesTraversed { get; set; }
 }
 
+internal enum Blake3Backend
+{
+    Gpu,
+    Cpu,
+}
+
+internal static class NativeBlake3Gpu
+{
+    private const string LibraryName = "libblake3gpu.so";
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr blake3_gpu_create(int maxChunks);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern void blake3_gpu_destroy(IntPtr ctx);
+
+    [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int blake3_gpu_hash_file(
+        IntPtr ctx,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        byte[] outHash32
+    );
+}
+
+internal sealed class Blake3GpuContext : IDisposable
+{
+    private IntPtr _ctx;
+
+    public Blake3GpuContext(int maxChunks)
+    {
+        _ctx = NativeBlake3Gpu.blake3_gpu_create(maxChunks);
+
+        if (_ctx == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Failed to create CUDA BLAKE3 context.");
+        }
+    }
+
+    public byte[] HashFile(string path)
+    {
+        if (_ctx == IntPtr.Zero)
+        {
+            throw new ObjectDisposedException(nameof(Blake3GpuContext));
+        }
+
+        var hash = new byte[32];
+        var rc = NativeBlake3Gpu.blake3_gpu_hash_file(_ctx, path, hash);
+
+        if (rc != 0)
+        {
+            throw new InvalidOperationException($"GPU hash failed with error code {rc}.");
+        }
+
+        return hash;
+    }
+
+    public void Dispose()
+    {
+        if (_ctx != IntPtr.Zero)
+        {
+            NativeBlake3Gpu.blake3_gpu_destroy(_ctx);
+            _ctx = IntPtr.Zero;
+        }
+
+        GC.SuppressFinalize(this);
+    }
+
+    ~Blake3GpuContext()
+    {
+        Dispose();
+    }
+}
+
 internal static class Program
 {
     private const string Green = "\u001b[32m";
     private const string Italic = "\u001b[3m";
     private const string Reset = "\u001b[0m";
+    private const Blake3Backend DefaultBlake3Backend = Blake3Backend.Cpu; // CPU by default
+    private const int DefaultGpuMaxChunks = 1 << 20;
 
     private static string WorkingDirectory = Directory.GetCurrentDirectory();
+    private static Blake3Backend? SelectedBlake3Backend;
+    private static bool Blake3GpuFallbackLogged;
 
     private static int Main(string[] args)
     {
@@ -482,12 +560,22 @@ internal static class Program
             yield return dir;
 
             var absoluteDir = dir == "." ? WorkingDirectory : GetAbsolutePath(dir);
-            var subDirs = Directory
-                .EnumerateDirectories(absoluteDir)
-                .Where(path => !string.Equals(Path.GetFileName(path), ".dups", StringComparison.Ordinal))
-                .Select(path => Path.GetFileName(path))
-                .OrderBy(name => name, StringComparer.Ordinal)
-                .ToList();
+            List<string> subDirs;
+            try
+            {
+                subDirs = Directory
+                    .EnumerateDirectories(absoluteDir)
+                    .Where(path => !IsSymlink(path))
+                    .Where(path => !string.Equals(Path.GetFileName(path), ".dups", StringComparison.Ordinal))
+                    .Select(path => Path.GetFileName(path))
+                    .OrderBy(name => name, StringComparer.Ordinal)
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                Warn("enumerate directories", dir, ex.Message);
+                continue;
+            }
 
             for (var i = subDirs.Count - 1; i >= 0; i--)
             {
@@ -502,8 +590,24 @@ internal static class Program
         var absoluteDir = directory == "." ? WorkingDirectory : GetAbsolutePath(directory);
         var files = new List<string>();
 
-        foreach (var file in Directory.EnumerateFiles(absoluteDir, "*", SearchOption.TopDirectoryOnly))
+        IEnumerable<string> filePaths;
+        try
         {
+            filePaths = Directory.EnumerateFiles(absoluteDir, "*", SearchOption.TopDirectoryOnly);
+        }
+        catch (Exception ex)
+        {
+            Warn("enumerate files", directory, ex.Message);
+            return files;
+        }
+
+        foreach (var file in filePaths)
+        {
+            if (IsSymlink(file))
+            {
+                continue;
+            }
+
             files.Add(ToUnixRelativePath(file));
         }
 
@@ -901,6 +1005,72 @@ internal static class Program
 
     private static string ComputeBlake3(string filePath)
     {
+        var backend = ResolveBlake3Backend();
+        if (backend == Blake3Backend.Cpu)
+        {
+            return ComputeBlake3Cpu(filePath);
+        }
+
+        try
+        {
+            return ComputeBlake3Gpu(filePath);
+        }
+        catch (Exception ex) when (CanFallbackFromGpu(ex))
+        {
+            if (!Blake3GpuFallbackLogged)
+            {
+                Console.Error.WriteLine($"Warning: GPU BLAKE3 backend unavailable ({ex.Message}). Falling back to CPU backend.");
+                Blake3GpuFallbackLogged = true;
+            }
+
+            SelectedBlake3Backend = Blake3Backend.Cpu;
+            return ComputeBlake3Cpu(filePath);
+        }
+    }
+
+    private static bool CanFallbackFromGpu(Exception ex)
+    {
+        return ex is DllNotFoundException
+            or EntryPointNotFoundException
+            or BadImageFormatException
+            or InvalidOperationException;
+    }
+
+    private static Blake3Backend ResolveBlake3Backend()
+    {
+        if (SelectedBlake3Backend is not null)
+        {
+            return SelectedBlake3Backend.Value;
+        }
+
+        var configured = Environment.GetEnvironmentVariable("LSHASH_BLAKE3_BACKEND");
+        if (string.IsNullOrWhiteSpace(configured))
+        {
+            SelectedBlake3Backend = DefaultBlake3Backend;
+            return SelectedBlake3Backend.Value;
+        }
+
+        SelectedBlake3Backend = configured.Trim().ToLowerInvariant() switch
+        {
+            "gpu" => Blake3Backend.Gpu,
+            "cpu" => Blake3Backend.Cpu,
+            _ => throw new InvalidOperationException(
+                "Invalid LSHASH_BLAKE3_BACKEND value. Supported values: gpu, cpu."
+            ),
+        };
+
+        return SelectedBlake3Backend.Value;
+    }
+
+    private static string ComputeBlake3Gpu(string filePath)
+    {
+        using var gpu = new Blake3GpuContext(ComputeRequiredGpuChunks(filePath));
+        var hash = gpu.HashFile(filePath);
+        return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    private static string ComputeBlake3Cpu(string filePath)
+    {
         var hasher = Hasher.New();
         var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
 
@@ -924,6 +1094,60 @@ internal static class Program
         }
 
         return hasher.Finalize().ToString().ToLowerInvariant();
+    }
+
+    private static int ComputeRequiredGpuChunks(string filePath)
+    {
+        const int chunkBytes = 1024;
+
+        var fileInfo = new FileInfo(filePath);
+        var requiredChunks = (fileInfo.Length + chunkBytes - 1) / chunkBytes;
+        if (requiredChunks <= 0)
+        {
+            requiredChunks = 1;
+        }
+
+        if (requiredChunks > int.MaxValue)
+        {
+            throw new InvalidOperationException("File is too large for GPU chunk configuration.");
+        }
+
+        var maxChunks = 1L;
+        while (maxChunks < requiredChunks && maxChunks <= (int.MaxValue / 2))
+        {
+            maxChunks <<= 1;
+        }
+
+        if (maxChunks < requiredChunks)
+        {
+            maxChunks = requiredChunks;
+        }
+
+        var configured = GetConfiguredGpuMaxChunks();
+        if (maxChunks < configured)
+        {
+            maxChunks = configured;
+        }
+
+        return (int)maxChunks;
+    }
+
+    private static int GetConfiguredGpuMaxChunks()
+    {
+        var configured = Environment.GetEnvironmentVariable("LSHASH_BLAKE3_GPU_MAX_CHUNKS");
+        if (string.IsNullOrWhiteSpace(configured))
+        {
+            return DefaultGpuMaxChunks;
+        }
+
+        if (!int.TryParse(configured, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) || parsed <= 0)
+        {
+            throw new InvalidOperationException(
+                "Invalid LSHASH_BLAKE3_GPU_MAX_CHUNKS value. It must be a positive integer."
+            );
+        }
+
+        return parsed;
     }
 
     private static string ComputeBlake2b512(string filePath)
@@ -966,6 +1190,20 @@ internal static class Program
     {
         var relative = Path.GetRelativePath(WorkingDirectory, absolutePath);
         return relative.Replace(Path.DirectorySeparatorChar, '/').Replace(Path.AltDirectorySeparatorChar, '/');
+    }
+
+    private static bool IsSymlink(string path)
+    {
+        try
+        {
+            var attributes = File.GetAttributes(path);
+            return (attributes & FileAttributes.ReparsePoint) != 0;
+        }
+        catch (Exception ex)
+        {
+            Warn("inspect path", ToUnixRelativePath(path), ex.Message);
+            return false;
+        }
     }
 
     private static string GetAbsolutePath(string relativePath)

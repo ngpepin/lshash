@@ -18,6 +18,7 @@ Topic tags: rag, retrieval-augmented-generation, data-curation, data-governance,
 - Highlights adjacent matching hashes in green.
 - Optional dedupe mode to keep one file and move duplicates into hidden `.dups/` directories.
 - Prints a completion summary with duplicate counts and percentages.
+- Supports macOS Catalina-compatible traversal behavior (no GNU `find -printf` / `sort -z` dependency).
 
 ## Upfront use-case perspective
 
@@ -48,7 +49,7 @@ This separation of discovery and action supports safer change control, clearer g
 
 ## Requirements
 
-- Bash 4+
+- Bash 3.2+
 - Standard Unix tools: `find`, `sort`, `awk`, `stat`, `mv`
 - Hash command for selected algorithm:
   - `b3sum` for `blake3`
@@ -57,6 +58,11 @@ This separation of discovery and action supports safer change control, clearer g
   - `sha1sum` for `sha1`
   - `md5sum` for `md5`
   - `b2sum` for `blake2`
+
+### macOS note
+
+- The script now runs on macOS Catalina or later shell/tooling for traversal and sorting behavior.
+- Hash command requirements still apply by algorithm choice. On macOS, `blake3` is typically the easiest path because `b3sum` can be auto-installed when package tooling is available.
 
 ### BLAKE3 auto-install behavior
 
@@ -96,6 +102,41 @@ Output executable:
 
 The publish configuration is self-contained and single-file, so no .NET runtime is required on the target host.
 
+### Build native macOS self-contained binaries
+
+```bash
+cd dotnet
+./build-macos.sh
+```
+
+Optional target selection:
+
+```bash
+cd dotnet
+./build-macos.sh osx-arm64
+./build-macos.sh osx-x64
+```
+
+Output executables:
+
+- `dotnet/dist/osx-arm64/lshash`
+- `dotnet/dist/osx-x64/lshash`
+
+### macOS deployment for .NET implementation
+
+Native .NET 10 self-contained binaries may fail on Catalina or earlier due to runtime/OS compatibility.
+
+Use the Docker deployment bundle instead:
+
+```bash
+cd dotnet/deploy/macos
+./deploy.sh build
+./deploy.sh audit /path/to/scan
+./deploy.sh cull /path/to/scan
+```
+
+The deployment wrapper is documented in `dotnet/deploy/macos/README.md`.
+
 ### Run from source
 
 ```bash
@@ -111,6 +152,17 @@ The .NET implementation supports the same options as Bash (`--algorithm`, `-r/--
   - With `-d/--dedupe`, dedupe by hash across all files in each directory, ignoring filename adjacency
   - Without `-d/--dedupe`, this flag is a no-op
 
+### .NET BLAKE3 backend selection
+
+- Default backend is GPU via `vendor/libblake3gpu.so`.
+- Override backend with environment variable `LSHASH_BLAKE3_BACKEND`:
+  - `gpu` (default)
+  - `cpu`
+- If GPU backend initialization or hashing fails at runtime, the process falls back to CPU BLAKE3 for the remainder of that run.
+- Optional GPU chunk budget override:
+  - `LSHASH_BLAKE3_GPU_MAX_CHUNKS` (positive integer)
+  - Default: `1048576` (`1 << 20`)
+
 ### .NET examples
 
 ```bash
@@ -125,6 +177,34 @@ dotnet/dist/linux-x64/lshash -d shorter --all-directory
 
 ```bash
 ./lshash.sh [--algorithm NAME] [-r|--recursive] [-e PATTERN] [--exclude PATTERN] [-d [MODE]] [--all-directory] [-q|--quiet] [DIRECTORY]
+```
+
+## macOS execution quick guide
+
+### Bash implementation (native, including Catalina)
+
+```bash
+cd /path/to/lshash
+chmod +x ./lshash.sh
+./lshash.sh --algorithm sha256 -r /path/to/scan
+```
+
+### .NET implementation on modern macOS (native)
+
+```bash
+cd dotnet
+./build-macos.sh
+./dist/osx-arm64/lshash --help   # Apple Silicon
+./dist/osx-x64/lshash --help     # Intel
+```
+
+### .NET implementation on macOS Catalina (Docker Desktop)
+
+```bash
+cd dotnet/deploy/macos
+./deploy.sh build
+./deploy.sh audit /path/to/scan
+./deploy.sh cull /path/to/scan
 ```
 
 ## Options

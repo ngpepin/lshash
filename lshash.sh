@@ -16,6 +16,13 @@ summary_total_files=0
 summary_duplicate_files=0
 summary_moved_files=0
 summary_directories=0
+platform_name="$(uname -s 2>/dev/null || echo Unknown)"
+is_macos="false"
+if [[ "$platform_name" == "Darwin" ]]; then
+  is_macos="true"
+fi
+current_group_files=()
+current_subdirs=()
 
 print_help() {
   cat <<'HELP'
@@ -152,6 +159,11 @@ auto_install_b3sum() {
 
 get_file_mtime() {
   local file="$1"
+
+  if [[ "$is_macos" == "true" ]]; then
+    stat -f %m -- "$file"
+    return
+  fi
 
   if stat -c %Y -- "$file" >/dev/null 2>&1; then
     stat -c %Y -- "$file"
@@ -401,11 +413,10 @@ print_summary() {
 }
 
 print_non_dedupe_group() {
-  local -n group_files="$1"
   local max_name_len=0
   local file
 
-  for file in "${group_files[@]}"; do
+  for file in "${current_group_files[@]}"; do
     if (( ${#file} > max_name_len )); then
       max_name_len=${#file}
     fi
@@ -414,7 +425,7 @@ print_non_dedupe_group() {
   local green=$'\033[32m'
   local reset=$'\033[0m'
 
-  for file in "${group_files[@]}"; do
+  for file in "${current_group_files[@]}"; do
     local hash
     if ! hash="$(try_hash_file "$file")"; then
       if [[ "$quiet" != "true" ]]; then
@@ -441,12 +452,11 @@ print_non_dedupe_group() {
 
 print_dedupe_group() {
   local dir_rel="$1"
-  local -n group_files="$2"
 
   local moved_suffix=" (moved to .dups/)"
   local max_name_len=0
   local file
-  for file in "${group_files[@]}"; do
+  for file in "${current_group_files[@]}"; do
     local possible_len=$(( ${#file} + ${#moved_suffix} ))
     if (( possible_len > max_name_len )); then
       max_name_len=$possible_len
@@ -596,11 +606,7 @@ print_dedupe_group() {
   }
 
   if [[ "$all_directory" == "true" ]]; then
-    local hash_to_indices
-    declare -A hash_to_indices=()
-    local idx=0
-
-    for file in "${group_files[@]}"; do
+    for file in "${current_group_files[@]}"; do
       local base_name="${file##*/}"
 
       local hash_valid="0"
@@ -622,23 +628,37 @@ print_dedupe_group() {
       run_mtimes+=("$mtime")
       run_mtime_valid+=("$mtime_valid")
       run_moved_flags+=("0")
-
-      if [[ "$hash_valid" == "1" ]]; then
-        if [[ -n "${hash_to_indices[$hash]:-}" ]]; then
-          hash_to_indices[$hash]+=" $idx"
-        else
-          hash_to_indices[$hash]="$idx"
-        fi
-      fi
-
-      idx=$((idx + 1))
     done
 
-    local hash_key
-    for hash_key in "${!hash_to_indices[@]}"; do
-      local indices_str="${hash_to_indices[$hash_key]}"
-      local indices=()
-      read -r -a indices <<< "$indices_str"
+    local entry_count=${#run_files[@]}
+    local processed_flags=()
+    local i
+    for (( i=0; i<entry_count; i++ )); do
+      processed_flags+=("0")
+    done
+
+    for (( i=0; i<entry_count; i++ )); do
+      if [[ "${processed_flags[$i]}" == "1" ]]; then
+        continue
+      fi
+      if [[ "${run_hash_valid[$i]}" != "1" ]]; then
+        continue
+      fi
+
+      local group_hash="${run_hashes[$i]}"
+      local indices=("$i")
+      processed_flags[$i]="1"
+
+      local j
+      for (( j=i+1; j<entry_count; j++ )); do
+        if [[ "${processed_flags[$j]}" == "1" ]]; then
+          continue
+        fi
+        if [[ "${run_hash_valid[$j]}" == "1" && "${run_hashes[$j]}" == "$group_hash" ]]; then
+          indices+=("$j")
+          processed_flags[$j]="1"
+        fi
+      done
 
       if (( ${#indices[@]} < 2 )); then
         continue
@@ -705,7 +725,7 @@ print_dedupe_group() {
 
         if safe_move_file "$source_path" "$target_path"; then
           run_moved_flags[$candidate_idx]="1"
-            summary_moved_files=$((summary_moved_files + 1))
+          summary_moved_files=$((summary_moved_files + 1))
         fi
       done
     done
@@ -714,7 +734,7 @@ print_dedupe_group() {
     return
   fi
 
-  for file in "${group_files[@]}"; do
+  for file in "${current_group_files[@]}"; do
     local base_name="${file##*/}"
 
     local hash_valid="0"
@@ -788,27 +808,23 @@ print_dedupe_group() {
 
 process_directory_files() {
   local dir_rel="$1"
-  local files_name="$2"
 
-  local -n files_ref="$files_name"
+  summary_total_files=$((summary_total_files + ${#current_group_files[@]}))
 
-  summary_total_files=$((summary_total_files + ${#files_ref[@]}))
-
-  if (( ${#files_ref[@]} == 0 )); then
+  if (( ${#current_group_files[@]} == 0 )); then
     return
   fi
 
   if [[ "$dedupe_enabled" == "true" ]]; then
-    print_dedupe_group "$dir_rel" "$files_name"
+    print_dedupe_group "$dir_rel"
   else
-    print_non_dedupe_group "$files_name"
+    print_non_dedupe_group
   fi
 }
 
 collect_files_for_directory() {
   local dir_rel="$1"
-  local -n out_files="$2"
-  out_files=()
+  current_group_files=()
 
   local search_dir
   if [[ "$dir_rel" == "." ]]; then
@@ -818,23 +834,65 @@ collect_files_for_directory() {
   fi
 
   local names=()
-  mapfile -d '' names < <(find "$search_dir" -mindepth 1 -maxdepth 1 -type f -printf '%f\0' | LC_ALL=C sort -z)
+  local candidate
+  shopt -s nullglob dotglob
+  for candidate in "$search_dir"/*; do
+    [[ -f "$candidate" ]] || continue
+    [[ -L "$candidate" ]] && continue
+    names+=("${candidate##*/}")
+  done
+  shopt -u nullglob dotglob
 
   local name
-  for name in "${names[@]}"; do
-    local rel
-    if [[ "$dir_rel" == "." ]]; then
-      rel="$name"
-    else
-      rel="$dir_rel/$name"
-    fi
+  if (( ${#names[@]} > 0 )); then
+    while IFS= read -r name; do
+      [[ -z "$name" ]] && continue
+      local rel
+      if [[ "$dir_rel" == "." ]]; then
+        rel="$name"
+      else
+        rel="$dir_rel/$name"
+      fi
 
-    if should_exclude "$rel"; then
-      continue
-    fi
+      if should_exclude "$rel"; then
+        continue
+      fi
 
-    out_files+=("$rel")
+      current_group_files+=("$rel")
+    done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort)
+  fi
+}
+
+collect_subdirs_for_directory() {
+  local dir_rel="$1"
+  current_subdirs=()
+
+  local search_dir
+  if [[ "$dir_rel" == "." ]]; then
+    search_dir="."
+  else
+    search_dir="$dir_rel"
+  fi
+
+  local names=()
+  local candidate
+  shopt -s nullglob dotglob
+  for candidate in "$search_dir"/*; do
+    [[ -d "$candidate" ]] || continue
+    [[ -L "$candidate" ]] && continue
+    local base_name="${candidate##*/}"
+    [[ "$base_name" == ".dups" ]] && continue
+    names+=("$base_name")
   done
+  shopt -u nullglob dotglob
+
+  local name
+  if (( ${#names[@]} > 0 )); then
+    while IFS= read -r name; do
+      [[ -z "$name" ]] && continue
+      current_subdirs+=("$name")
+    done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort)
+  fi
 }
 
 walk_recursive_and_process() {
@@ -845,23 +903,13 @@ walk_recursive_and_process() {
     unset 'stack[$(( ${#stack[@]} - 1 ))]'
     summary_directories=$((summary_directories + 1))
 
-    local dir_files=()
-    collect_files_for_directory "$dir_rel" dir_files
-    process_directory_files "$dir_rel" dir_files
-
-    local search_dir
-    if [[ "$dir_rel" == "." ]]; then
-      search_dir="."
-    else
-      search_dir="$dir_rel"
-    fi
-
-    local subdirs=()
-    mapfile -d '' subdirs < <(find "$search_dir" -mindepth 1 -maxdepth 1 -type d ! -name '.dups' -printf '%f\0' | LC_ALL=C sort -z)
+    collect_files_for_directory "$dir_rel"
+    process_directory_files "$dir_rel"
+    collect_subdirs_for_directory "$dir_rel"
 
     local i
-    for (( i=${#subdirs[@]}-1; i>=0; i-- )); do
-      local sub="${subdirs[$i]}"
+    for (( i=${#current_subdirs[@]}-1; i>=0; i-- )); do
+      local sub="${current_subdirs[$i]}"
       if [[ "$dir_rel" == "." ]]; then
         stack+=("$sub")
       else
@@ -936,9 +984,8 @@ fi
 if [[ "$recursive" == "true" ]]; then
   walk_recursive_and_process
 else
-  root_files=()
-  collect_files_for_directory "." root_files
-  process_directory_files "." root_files
+  collect_files_for_directory "."
+  process_directory_files "."
 fi
 
 print_summary
