@@ -8,6 +8,7 @@ exclude_patterns=()
 dedupe_enabled="false"
 dedupe_mode="shorter"
 all_directory="false"
+prompt_delete="false"
 quiet="false"
 target_dir="."
 target_dir_set="false"
@@ -17,6 +18,7 @@ summary_duplicate_files=0
 summary_moved_files=0
 summary_directories=0
 console_width=0
+dups_dirs=()
 platform_name="$(uname -s 2>/dev/null || echo Unknown)"
 is_macos="false"
 if [[ "$platform_name" == "Darwin" ]]; then
@@ -42,6 +44,7 @@ Options:
   -d, --dedupe [MODE]        Dedupe files with same hash in each directory
       --dedupe=MODE          Keep one file by MODE, move others to .dups/
       --all-directory        With -d, dedupe all files in directory by hash
+        --prompt-delete        After listing .dups directories, prompt y/N to delete them
   -q, --quiet                Only print duplicate (green) file lines
 
 Short-option stacking:
@@ -225,6 +228,9 @@ parse_args() {
       --all-directory)
         all_directory="true"
         ;;
+      --prompt-delete)
+        prompt_delete="true"
+        ;;
       -h|--help)
         print_help
         exit 0
@@ -374,6 +380,70 @@ safe_move_file() {
 
   warn_file_issue "move" "$source_path" "$output"
   return 1
+}
+
+remember_dups_dir() {
+  local dups_dir_rel="$1"
+  local full_path
+
+  if ! full_path="$(cd -- "$dups_dir_rel" 2>/dev/null && pwd -P)"; then
+    return
+  fi
+
+  local existing
+  for existing in "${dups_dirs[@]}"; do
+    if [[ "$existing" == "$full_path" ]]; then
+      return
+    fi
+  done
+
+  dups_dirs+=("$full_path")
+}
+
+print_dups_directories() {
+  local green=$'\033[32m'
+  local reset=$'\033[0m'
+
+  if (( ${#dups_dirs[@]} == 0 )); then
+    printf '%b%s%b\n' "$green" "No duplicates were moved into .dups directories." "$reset"
+    return
+  fi
+
+  local dir
+  while IFS= read -r dir; do
+    [[ -z "$dir" ]] && continue
+    printf '%b%s%b\n' "$green" "$dir" "$reset"
+  done < <(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)
+}
+
+prompt_delete_dups_directories() {
+  if (( ${#dups_dirs[@]} == 0 )); then
+    return
+  fi
+
+  local reply=""
+  if [[ -t 0 ]]; then
+    printf 'Delete listed .dups directories? y/N: '
+    read -r reply
+  elif [[ -r /dev/tty ]]; then
+    printf 'Delete listed .dups directories? y/N: ' > /dev/tty
+    read -r reply < /dev/tty
+  else
+    echo "Warning: --prompt-delete requested, but input is not interactive; skipping delete prompt." >&2
+    return
+  fi
+
+  if [[ "$reply" != "y" && "$reply" != "Y" ]]; then
+    return
+  fi
+
+  local dir
+  while IFS= read -r dir; do
+    [[ -z "$dir" ]] && continue
+    if ! rm -rf -- "$dir" 2>/dev/null; then
+      warn_file_issue "delete" "$dir" "failed to remove directory"
+    fi
+  done < <(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)
 }
 
 is_program_mime_type() {
@@ -577,6 +647,8 @@ format_percent() {
 print_summary() {
   local duplicates_reported
   local duplicate_phrase
+  local yellow_bold=$'\033[1;33m'
+  local reset=$'\033[0m'
 
   if [[ "$dedupe_enabled" == "true" ]]; then
     duplicates_reported="$summary_moved_files"
@@ -590,11 +662,11 @@ print_summary() {
   duplicate_percent="$(format_percent "$duplicates_reported" "$summary_total_files")"
 
   if [[ "$recursive" == "true" ]]; then
-    printf 'Summary: scanned %d file(s); %d duplicate file(s) %s (%s%% of scanned files); %d directories were traversed.\n' \
-      "$summary_total_files" "$duplicates_reported" "$duplicate_phrase" "$duplicate_percent" "$summary_directories"
+    printf '%bSummary: scanned %d file(s); %d duplicate file(s) %s (%s%% of scanned files); %d directories were traversed.%b\n' \
+      "$yellow_bold" "$summary_total_files" "$duplicates_reported" "$duplicate_phrase" "$duplicate_percent" "$summary_directories" "$reset"
   else
-    printf 'Summary: scanned %d file(s); %d duplicate file(s) %s (%s%% of scanned files).\n' \
-      "$summary_total_files" "$duplicates_reported" "$duplicate_phrase" "$duplicate_percent"
+    printf '%bSummary: scanned %d file(s); %d duplicate file(s) %s (%s%% of scanned files).%b\n' \
+      "$yellow_bold" "$summary_total_files" "$duplicates_reported" "$duplicate_phrase" "$duplicate_percent" "$reset"
   fi
 }
 
@@ -784,6 +856,7 @@ print_dedupe_group() {
 
         if safe_move_file "$source_path" "$target_path"; then
           run_moved_flags[$candidate_idx]="1"
+          remember_dups_dir "$dups_dir"
             summary_moved_files=$((summary_moved_files + 1))
         fi
       done
@@ -927,6 +1000,7 @@ print_dedupe_group() {
 
         if safe_move_file "$source_path" "$target_path"; then
           run_moved_flags[$candidate_idx]="1"
+          remember_dups_dir "$dups_dir"
           summary_moved_files=$((summary_moved_files + 1))
         fi
       done
@@ -1204,3 +1278,11 @@ else
 fi
 
 print_summary
+
+if [[ "$dedupe_enabled" == "true" ]]; then
+  print_dups_directories
+fi
+
+if [[ "$prompt_delete" == "true" ]]; then
+  prompt_delete_dups_directories
+fi

@@ -46,6 +46,8 @@ internal sealed class Options
 
     public bool AllDirectoryDedupe { get; set; }
 
+    public bool PromptDelete { get; set; }
+
     public string RootDirectory { get; set; } = ".";
 }
 
@@ -79,6 +81,8 @@ internal sealed class SummaryStats
     public long DuplicateFilesMoved { get; set; }
 
     public long DirectoriesTraversed { get; set; }
+
+    public HashSet<string> DupsDirectories { get; } = new(StringComparer.Ordinal);
 }
 
 internal enum Blake3Backend
@@ -156,6 +160,7 @@ internal sealed class Blake3GpuContext : IDisposable
 
 internal static class Program
 {
+    private const string BoldYellow = "\u001b[1;33m";
     private const string Green = "\u001b[32m";
     private const string Gray = "\u001b[37m";
     private const string Italic = "\u001b[3m";
@@ -254,6 +259,12 @@ internal static class Program
                 if (arg == "--all-directory")
                 {
                     options.AllDirectoryDedupe = true;
+                    continue;
+                }
+
+                if (arg == "--prompt-delete")
+                {
+                    options.PromptDelete = true;
                     continue;
                 }
 
@@ -494,6 +505,7 @@ internal static class Program
               -d, --dedupe [MODE]        Dedupe files with same hash in each directory
                   --dedupe=MODE          Keep one file by MODE, move others to .dups/
               --all-directory            With -d, dedupe using all files in directory by hash (ignores filename adjacency)
+              --prompt-delete            After listing .dups directories, prompt y/N to delete them
               -q, --quiet                Only print duplicate (green) file lines
 
             Short-option stacking:
@@ -739,7 +751,7 @@ internal static class Program
                         continue;
                     }
 
-                    if (TryMoveToDups(runEntries[index]))
+                    if (TryMoveToDups(runEntries[index], summaryStats))
                     {
                         runEntries[index].Moved = true;
                         summaryStats.DuplicateFilesMoved++;
@@ -801,7 +813,7 @@ internal static class Program
                         continue;
                     }
 
-                    if (TryMoveToDups(entries[index]))
+                    if (TryMoveToDups(entries[index], summaryStats))
                     {
                         entries[index].Moved = true;
                         summaryStats.DuplicateFilesMoved++;
@@ -870,18 +882,77 @@ internal static class Program
         var duplicatesReported = options.DedupeEnabled ? summaryStats.DuplicateFilesMoved : summaryStats.DuplicateFilesFound;
         var duplicatePhrase = options.DedupeEnabled ? "were found and moved" : "were found";
         var duplicatePercent = FormatPercent(duplicatesReported, summaryStats.TotalFilesScanned);
+        string summaryLine;
 
         if (options.Recursive)
         {
-            Console.WriteLine(
-                $"Summary: scanned {summaryStats.TotalFilesScanned} file(s); {duplicatesReported} duplicate file(s) {duplicatePhrase} ({duplicatePercent}% of scanned files); {summaryStats.DirectoriesTraversed} directories were traversed."
-            );
+            summaryLine =
+                $"Summary: scanned {summaryStats.TotalFilesScanned} file(s); {duplicatesReported} duplicate file(s) {duplicatePhrase} ({duplicatePercent}% of scanned files); {summaryStats.DirectoriesTraversed} directories were traversed.";
+        }
+        else
+        {
+            summaryLine =
+                $"Summary: scanned {summaryStats.TotalFilesScanned} file(s); {duplicatesReported} duplicate file(s) {duplicatePhrase} ({duplicatePercent}% of scanned files).";
+        }
+
+        Console.WriteLine($"{BoldYellow}{summaryLine}{Reset}");
+
+        if (options.DedupeEnabled)
+        {
+            PrintDupsDirectories(summaryStats);
+        }
+
+        if (options.PromptDelete)
+        {
+            PromptDeleteDupsDirectories(summaryStats);
+        }
+    }
+
+    private static void PrintDupsDirectories(SummaryStats summaryStats)
+    {
+        if (summaryStats.DupsDirectories.Count == 0)
+        {
+            Console.WriteLine($"{Green}No duplicates were moved into .dups directories.{Reset}");
             return;
         }
 
-        Console.WriteLine(
-            $"Summary: scanned {summaryStats.TotalFilesScanned} file(s); {duplicatesReported} duplicate file(s) {duplicatePhrase} ({duplicatePercent}% of scanned files)."
-        );
+        foreach (var dupsDir in summaryStats.DupsDirectories.OrderBy(path => path, StringComparer.Ordinal))
+        {
+            Console.WriteLine($"{Green}{dupsDir}{Reset}");
+        }
+    }
+
+    private static void PromptDeleteDupsDirectories(SummaryStats summaryStats)
+    {
+        if (summaryStats.DupsDirectories.Count == 0)
+        {
+            return;
+        }
+
+        if (Console.IsInputRedirected)
+        {
+            Console.Error.WriteLine("Warning: --prompt-delete requested, but input is not interactive; skipping delete prompt.");
+            return;
+        }
+
+        Console.Write("Delete listed .dups directories? y/N: ");
+        var answer = Console.ReadLine();
+        if (!string.Equals(answer?.Trim(), "y", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        foreach (var dupsDir in summaryStats.DupsDirectories.OrderBy(path => path, StringComparer.Ordinal))
+        {
+            try
+            {
+                Directory.Delete(dupsDir, recursive: true);
+            }
+            catch (Exception ex)
+            {
+                Warn("delete", dupsDir, ex.Message);
+            }
+        }
     }
 
     private static string FormatPercent(long numerator, long denominator)
@@ -1024,7 +1095,7 @@ internal static class Program
         };
     }
 
-    private static bool TryMoveToDups(FileEntry entry)
+    private static bool TryMoveToDups(FileEntry entry, SummaryStats summaryStats)
     {
         try
         {
@@ -1046,6 +1117,7 @@ internal static class Program
             }
 
             File.Move(sourcePath, targetPath);
+            summaryStats.DupsDirectories.Add(dupsDirAbs);
             return true;
         }
         catch (Exception ex)

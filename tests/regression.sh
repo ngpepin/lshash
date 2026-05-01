@@ -47,6 +47,18 @@ ensure_dotnet_binary() {
   (cd "$ROOT_DIR/dotnet" && ./build.sh linux-x64 >/dev/null)
 }
 
+normalize_case_root() {
+  local file="$1"
+  local root="$2"
+  local escaped_root
+  local tmp
+
+  escaped_root="$(printf '%s' "$root" | sed -e 's/[.[\*^$()+?{}|\/]/\\&/g' -e 's/&/\\&/g')"
+  tmp="$(mktemp)"
+  sed "s/${escaped_root}/<CASE_ROOT>/g" "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
 run_impl() {
   local work_dir="$1"
   local out_file="$2"
@@ -75,6 +87,9 @@ run_pair() {
 
   strip_ansi < "$tmpdir/bash.out" > "$tmpdir/bash.clean"
   strip_ansi < "$tmpdir/dotnet.out" > "$tmpdir/dotnet.clean"
+
+  normalize_case_root "$tmpdir/bash.clean" "$bash_case"
+  normalize_case_root "$tmpdir/dotnet.clean" "$dotnet_case"
 
   assert_same_output "$tmpdir/bash.clean" "$tmpdir/dotnet.clean" "$scenario_name: bash/.NET outputs differ"
 
