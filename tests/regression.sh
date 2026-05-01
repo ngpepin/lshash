@@ -136,6 +136,14 @@ setup_inaccessible_subdirectory() {
   chmod 000 "$root/blocked"
 }
 
+setup_executable_program_exclusion() {
+  local root="$1"
+  printf 'same\n' > "$root/a.txt"
+  cp "$root/a.txt" "$root/aa.txt"
+  cp "$DOTNET_IMPL" "$root/prog-a"
+  cp "$DOTNET_IMPL" "$root/prog-b"
+}
+
 main() {
   ensure_dotnet_binary
 
@@ -210,6 +218,16 @@ main() {
   assert_contains "$case_dir/bash.clean" "open/a.txt" "recursive traversal should continue processing accessible directories"
   assert_contains "$case_dir/bash.clean" "Summary: scanned" "recursive traversal should still emit summary when a subdirectory is inaccessible"
   chmod 755 "$case_dir/bashcase/blocked" "$case_dir/dotnetcase/blocked" || true
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "dedupe excludes executable programs" setup_executable_program_exclusion --algorithm=sha256 -d shorter --all-directory)"
+  assert_contains "$case_dir/bash.clean" "prog-a" "executable program entries should still be listed"
+  assert_contains "$case_dir/bash.clean" "<excluded executable program>" "executable program entries should be explicitly excluded from dedupe"
+  assert_not_contains "$case_dir/bash.clean" "prog-b (moved to .dups/)" "executable programs should not be moved by dedupe"
+  [[ -f "$case_dir/bashcase/.dups/aa.txt" ]] || { echo "Assertion failed: regular duplicate should still be moved" >&2; exit 1; }
+  [[ -f "$case_dir/dotnetcase/.dups/aa.txt" ]] || { echo "Assertion failed: dotnet regular duplicate should still be moved" >&2; exit 1; }
+  [[ ! -f "$case_dir/bashcase/.dups/prog-b" ]] || { echo "Assertion failed: bash should not move excluded executable program" >&2; exit 1; }
+  [[ ! -f "$case_dir/dotnetcase/.dups/prog-b" ]] || { echo "Assertion failed: dotnet should not move excluded executable program" >&2; exit 1; }
   rm -rf "$case_dir"
 
   echo "All regression checks passed."

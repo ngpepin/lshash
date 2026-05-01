@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -63,6 +64,8 @@ internal sealed class FileEntry
     public long MtimeSeconds { get; init; }
 
     public bool MtimeAvailable { get; init; }
+
+    public bool ExcludedExecutableProgram { get; init; }
 
     public bool Moved { get; set; }
 }
@@ -154,14 +157,18 @@ internal sealed class Blake3GpuContext : IDisposable
 internal static class Program
 {
     private const string Green = "\u001b[32m";
+    private const string Gray = "\u001b[37m";
     private const string Italic = "\u001b[3m";
     private const string Reset = "\u001b[0m";
+    private const char MiddleDot = '\u00B7';
     private const Blake3Backend DefaultBlake3Backend = Blake3Backend.Cpu; // CPU by default
     private const int DefaultGpuMaxChunks = 1 << 20;
+    private static readonly Regex AnsiEscapeRegex = new("\u001B\\[[0-9;]*m", RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private static string WorkingDirectory = Directory.GetCurrentDirectory();
     private static Blake3Backend? SelectedBlake3Backend;
     private static bool Blake3GpuFallbackLogged;
+    private static int? CachedConsoleWidth;
 
     private static int Main(string[] args)
     {
@@ -618,6 +625,7 @@ internal static class Program
     private static string PrintNonDedupe(List<string> files, HashAlgorithmKind algorithm, bool quiet, SummaryStats summaryStats, string previousHash)
     {
         var maxNameLen = files.Max(path => path.Length);
+        var consoleWidth = GetConsoleWidth();
 
         foreach (var file in files)
         {
@@ -625,7 +633,10 @@ internal static class Program
             {
                 if (!quiet)
                 {
-                    Console.WriteLine($"{file.PadRight(maxNameLen)}  <hash unavailable>");
+                    var unavailableHash = "<hash unavailable>";
+                    var displayName = FormatNameField(file, unavailableHash, consoleWidth, maxNameLen, italicize: false);
+
+                    Console.WriteLine($"{displayName}{unavailableHash}");
                 }
 
                 continue;
@@ -641,7 +652,9 @@ internal static class Program
 
             if (!quiet || isDuplicate)
             {
-                Console.WriteLine($"{file.PadRight(maxNameLen)}  {displayHash}");
+                var displayName = FormatNameField(file, displayHash, consoleWidth, maxNameLen, italicize: false);
+
+                Console.WriteLine($"{displayName}{displayHash}");
             }
 
             previousHash = hash;
@@ -654,6 +667,7 @@ internal static class Program
     {
         const string movedSuffix = " (moved to .dups/)";
         var maxNameLen = files.Max(path => path.Length + movedSuffix.Length);
+        var consoleWidth = GetConsoleWidth();
 
         var runActive = false;
         var runHash = string.Empty;
@@ -663,7 +677,11 @@ internal static class Program
         {
             string displayHash;
             var isDuplicate = false;
-            if (entry.HashAvailable && entry.Hash is not null)
+            if (entry.ExcludedExecutableProgram)
+            {
+                displayHash = "<excluded executable program>";
+            }
+            else if (entry.HashAvailable && entry.Hash is not null)
             {
                 isDuplicate = previousHash.Length > 0 && entry.Hash == previousHash;
                 if (isDuplicate)
@@ -685,16 +703,8 @@ internal static class Program
             }
 
             var displayName = entry.Moved ? entry.RelativePath + movedSuffix : entry.RelativePath;
-            displayName = displayName.PadRight(maxNameLen);
-
-            if (entry.Moved)
-            {
-                Console.WriteLine($"{Italic}{displayName}{Reset}  {displayHash}");
-            }
-            else
-            {
-                Console.WriteLine($"{displayName}  {displayHash}");
-            }
+            var formattedName = FormatNameField(displayName, displayHash, consoleWidth, maxNameLen, italicize: entry.Moved);
+            Console.WriteLine($"{formattedName}{displayHash}");
         }
 
         void FlushRun()
@@ -887,6 +897,22 @@ internal static class Program
 
     private static FileEntry BuildEntry(string file, HashAlgorithmKind algorithm)
     {
+        if (IsExecutableProgramForDedupe(file))
+        {
+            return new FileEntry
+            {
+                RelativePath = file,
+                DirectoryPath = GetDirectoryPath(file),
+                BaseName = Path.GetFileName(file) ?? file,
+                Hash = null,
+                HashAvailable = false,
+                MtimeSeconds = 0,
+                MtimeAvailable = false,
+                ExcludedExecutableProgram = true,
+                Moved = false,
+            };
+        }
+
         var hashAvailable = TryComputeHash(file, algorithm, out var hash);
         var mtimeAvailable = TryGetMtimeSeconds(file, out var mtime);
 
@@ -899,8 +925,91 @@ internal static class Program
             HashAvailable = hashAvailable,
             MtimeSeconds = mtimeAvailable ? mtime : 0,
             MtimeAvailable = mtimeAvailable,
+            ExcludedExecutableProgram = false,
             Moved = false,
         };
+    }
+
+    private static bool IsExecutableProgramForDedupe(string relativePath)
+    {
+        var absolutePath = GetAbsolutePath(relativePath);
+        if (!HasAnyExecuteBit(absolutePath))
+        {
+            return false;
+        }
+
+        return TryGetMimeType(absolutePath, out var mimeType) && IsProgramMimeType(mimeType);
+    }
+
+    private static bool HasAnyExecuteBit(string filePath)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        try
+        {
+            var mode = File.GetUnixFileMode(filePath);
+            return (mode & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetMimeType(string filePath, out string mimeType)
+    {
+        mimeType = string.Empty;
+
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "file",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+
+            startInfo.ArgumentList.Add("--mime-type");
+            startInfo.ArgumentList.Add("-b");
+            startInfo.ArgumentList.Add("--");
+            startInfo.ArgumentList.Add(filePath);
+
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return false;
+            }
+
+            var output = process.StandardOutput.ReadToEnd().Trim();
+            process.WaitForExit();
+            if (process.ExitCode != 0 || output.Length == 0)
+            {
+                return false;
+            }
+
+            mimeType = output;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsProgramMimeType(string mimeType)
+    {
+        return mimeType.Equals("application/x-executable", StringComparison.OrdinalIgnoreCase)
+            || mimeType.Equals("application/x-pie-executable", StringComparison.OrdinalIgnoreCase)
+            || mimeType.Equals("application/x-mach-binary", StringComparison.OrdinalIgnoreCase)
+            || mimeType.Equals("application/x-dosexec", StringComparison.OrdinalIgnoreCase)
+            || mimeType.Equals("application/vnd.microsoft.portable-executable", StringComparison.OrdinalIgnoreCase)
+            || (mimeType.StartsWith("application/", StringComparison.OrdinalIgnoreCase)
+                && mimeType.Contains("program", StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool ShouldReplace(FileEntry candidate, FileEntry current, DedupeMode mode)
@@ -1210,6 +1319,157 @@ internal static class Program
     {
         var local = relativePath.Replace('/', Path.DirectorySeparatorChar);
         return Path.GetFullPath(Path.Combine(WorkingDirectory, local));
+    }
+
+    private static string FormatNameField(string fileName, string displayHash, int consoleWidth, int fallbackNameWidth, bool italicize)
+    {
+        var fieldWidth = consoleWidth > 0
+            ? consoleWidth - VisibleLength(displayHash)
+            : fallbackNameWidth;
+
+        if (fieldWidth <= 0)
+        {
+            fieldWidth = 3;
+        }
+
+        var fitted = TruncateRightWithEllipsis(fileName, fieldWidth);
+        var sb = new StringBuilder();
+
+        if (italicize)
+        {
+            sb.Append(Italic);
+        }
+
+        sb.Append(fitted);
+
+        if (italicize)
+        {
+            sb.Append(Reset);
+        }
+
+        var padCount = fieldWidth - fitted.Length;
+        if (padCount > 0)
+        {
+            sb.Append(Gray);
+            sb.Append(new string(MiddleDot, padCount));
+            sb.Append(Reset);
+        }
+
+        return sb.ToString();
+    }
+
+    private static int GetConsoleWidth()
+    {
+        if (CachedConsoleWidth is not null)
+        {
+            return CachedConsoleWidth.Value;
+        }
+
+        var outputIsTerminal = !Console.IsOutputRedirected;
+
+        var overrideWidth = Environment.GetEnvironmentVariable("LSHASH_CONSOLE_WIDTH");
+        if (int.TryParse(overrideWidth, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedOverride)
+            && parsedOverride > 0)
+        {
+            CachedConsoleWidth = parsedOverride;
+            return CachedConsoleWidth.Value;
+        }
+
+        if (outputIsTerminal)
+        {
+            try
+            {
+                if (Console.WindowWidth > 0)
+                {
+                    CachedConsoleWidth = Console.WindowWidth;
+                    return CachedConsoleWidth.Value;
+                }
+            }
+            catch
+            {
+                // Fall through to environment variable and command detection.
+            }
+        }
+
+        var columns = Environment.GetEnvironmentVariable("COLUMNS");
+        if (int.TryParse(columns, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedColumns) && parsedColumns > 0)
+        {
+            CachedConsoleWidth = parsedColumns;
+            return CachedConsoleWidth.Value;
+        }
+
+        if (outputIsTerminal && TryGetWidthFromTput(out var tputWidth) && tputWidth > 0)
+        {
+            CachedConsoleWidth = tputWidth;
+            return CachedConsoleWidth.Value;
+        }
+
+        // Conservative fallback only for interactive terminals.
+        CachedConsoleWidth = outputIsTerminal ? 80 : 0;
+        return CachedConsoleWidth.Value;
+    }
+
+    private static bool TryGetWidthFromTput(out int width)
+    {
+        width = 0;
+
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "tput",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            startInfo.ArgumentList.Add("cols");
+
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return false;
+            }
+
+            var output = process.StandardOutput.ReadToEnd().Trim();
+            process.WaitForExit();
+            if (process.ExitCode != 0)
+            {
+                return false;
+            }
+
+            return int.TryParse(output, NumberStyles.Integer, CultureInfo.InvariantCulture, out width) && width > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static int VisibleLength(string text)
+    {
+        var withoutAnsi = AnsiEscapeRegex.Replace(text, string.Empty);
+        return withoutAnsi.Length;
+    }
+
+    private static string TruncateRightWithEllipsis(string text, int maxWidth)
+    {
+        if (maxWidth <= 0)
+        {
+            return string.Empty;
+        }
+
+        if (text.Length <= maxWidth)
+        {
+            return text;
+        }
+
+        if (maxWidth <= 3)
+        {
+            return new string('.', maxWidth);
+        }
+
+        return text[..(maxWidth - 3)] + "...";
     }
 
     private static bool GlobMatch(string input, string pattern)

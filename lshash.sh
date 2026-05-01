@@ -16,6 +16,7 @@ summary_total_files=0
 summary_duplicate_files=0
 summary_moved_files=0
 summary_directories=0
+console_width=0
 platform_name="$(uname -s 2>/dev/null || echo Unknown)"
 is_macos="false"
 if [[ "$platform_name" == "Darwin" ]]; then
@@ -375,6 +376,191 @@ safe_move_file() {
   return 1
 }
 
+is_program_mime_type() {
+  local mime_type="$1"
+
+  case "$mime_type" in
+    application/x-executable|application/x-pie-executable|application/x-mach-binary|application/x-dosexec|application/vnd.microsoft.portable-executable)
+      return 0
+      ;;
+  esac
+
+  if [[ "$mime_type" == application/*program* ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+has_any_execute_permission_bit() {
+  local file="$1"
+  local mode
+
+  if [[ "$is_macos" == "true" ]]; then
+    mode="$(stat -f %Lp -- "$file" 2>/dev/null || true)"
+  else
+    mode="$(stat -c %a -- "$file" 2>/dev/null || stat -f %Lp -- "$file" 2>/dev/null || true)"
+  fi
+
+  [[ -n "$mode" ]] || return 1
+
+  # Keep the permission bits only (last 3 octal digits).
+  mode="${mode: -3}"
+
+  if (( (8#$mode & 8#111) != 0 )); then
+    return 0
+  fi
+
+  return 1
+}
+
+is_executable_program_for_dedupe() {
+  local file="$1"
+
+  has_any_execute_permission_bit "$file" || return 1
+  command -v file >/dev/null 2>&1 || return 1
+
+  local mime_type
+  if ! mime_type="$(file --mime-type -b -- "$file" 2>/dev/null)"; then
+    return 1
+  fi
+
+  is_program_mime_type "$mime_type"
+}
+
+detect_console_width() {
+  console_width=0
+
+  if [[ -n "${LSHASH_CONSOLE_WIDTH:-}" && "$LSHASH_CONSOLE_WIDTH" =~ ^[0-9]+$ && "$LSHASH_CONSOLE_WIDTH" -gt 0 ]]; then
+    console_width="$LSHASH_CONSOLE_WIDTH"
+    return
+  fi
+
+  if [[ -n "${COLUMNS:-}" && "$COLUMNS" =~ ^[0-9]+$ && "$COLUMNS" -gt 0 ]]; then
+    console_width="$COLUMNS"
+    return
+  fi
+
+  if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
+    local cols
+    cols="$(tput cols 2>/dev/null || true)"
+    if [[ "$cols" =~ ^[0-9]+$ && "$cols" -gt 0 ]]; then
+      console_width="$cols"
+      return
+    fi
+  fi
+
+  if [[ -t 1 ]]; then
+    local stty_size
+    stty_size="$(stty size 2>/dev/null || true)"
+    local cols="${stty_size##* }"
+    if [[ "$cols" =~ ^[0-9]+$ && "$cols" -gt 0 ]]; then
+      console_width="$cols"
+      return
+    fi
+  fi
+
+  if [[ -t 1 ]]; then
+    # Conservative fallback for interactive terminals when width cannot be detected.
+    console_width=80
+  fi
+}
+
+strip_ansi_codes() {
+  local text="$1"
+  printf '%s' "$text" | sed -E $'s/\x1b\[[0-9;]*m//g'
+}
+
+visible_text_length() {
+  local text="$1"
+  local plain
+  plain="$(strip_ansi_codes "$text")"
+  printf '%d' "${#plain}"
+}
+
+truncate_right_with_ellipsis() {
+  local text="$1"
+  local max_width="$2"
+
+  if (( max_width <= 0 )); then
+    printf ''
+    return
+  fi
+
+  if (( ${#text} <= max_width )); then
+    printf '%s' "$text"
+    return
+  fi
+
+  if (( max_width <= 3 )); then
+    printf '%*s' "$max_width" '' | tr ' ' '.'
+    return
+  fi
+
+  printf '%s...' "${text:0:max_width-3}"
+}
+
+repeat_middle_dots() {
+  local count="$1"
+  local dots=""
+  local i
+
+  for (( i=0; i<count; i++ )); do
+    dots+="·"
+  done
+
+  printf '%s' "$dots"
+}
+
+format_name_field() {
+  local display_name="$1"
+  local display_hash="$2"
+  local fallback_width="$3"
+  local italicize="$4"
+  local gray=$'\033[37m'
+  local italic=$'\033[3m'
+  local reset=$'\033[0m'
+
+  local field_width="$fallback_width"
+  if (( console_width > 0 )); then
+    local hash_len
+    hash_len="$(visible_text_length "$display_hash")"
+    field_width=$(( console_width - hash_len ))
+  fi
+
+  if (( field_width <= 0 )); then
+    field_width=3
+  fi
+
+  local fitted_name
+  fitted_name="$(truncate_right_with_ellipsis "$display_name" "$field_width")"
+  local fitted_len=${#fitted_name}
+  local pad_count=$(( field_width - fitted_len ))
+  if (( pad_count < 0 )); then
+    pad_count=0
+  fi
+
+  local pad=""
+  if (( pad_count > 0 )); then
+    pad="$(repeat_middle_dots "$pad_count")"
+  fi
+
+  if [[ "$italicize" == "true" ]]; then
+    if (( pad_count > 0 )); then
+      printf '%b%s%b%b%s%b' "$italic" "$fitted_name" "$reset" "$gray" "$pad" "$reset"
+    else
+      printf '%b%s%b' "$italic" "$fitted_name" "$reset"
+    fi
+    return
+  fi
+
+  if (( pad_count > 0 )); then
+    printf '%s%b%s%b' "$fitted_name" "$gray" "$pad" "$reset"
+  else
+    printf '%s' "$fitted_name"
+  fi
+}
+
 format_percent() {
   local numerator="$1"
   local denominator="$2"
@@ -429,7 +615,10 @@ print_non_dedupe_group() {
     local hash
     if ! hash="$(try_hash_file "$file")"; then
       if [[ "$quiet" != "true" ]]; then
-        printf "%-*s  %s\n" "$max_name_len" "$file" "<hash unavailable>"
+        local display_hash="<hash unavailable>"
+        local display_name
+          display_name="$(format_name_field "$file" "$display_hash" "$max_name_len" "false")"
+          printf "%s%s\n" "$display_name" "$display_hash"
       fi
       continue
     fi
@@ -443,7 +632,9 @@ print_non_dedupe_group() {
     fi
 
     if [[ "$quiet" != "true" || "$is_duplicate" == "true" ]]; then
-      printf "%-*s  %b\n" "$max_name_len" "$file" "$display_hash"
+      local display_name
+      display_name="$(format_name_field "$file" "$display_hash" "$max_name_len" "false")"
+      printf "%s%b\n" "$display_name" "$display_hash"
     fi
 
     prev_hash="$hash"
@@ -472,6 +663,7 @@ print_dedupe_group() {
   local run_files=()
   local run_hashes=()
   local run_hash_valid=()
+  local run_excluded_exec=()
   local run_basenames=()
   local run_mtimes=()
   local run_mtime_valid=()
@@ -488,7 +680,9 @@ print_dedupe_group() {
 
       local display_hash
       local is_duplicate="false"
-      if [[ "${run_hash_valid[$j]}" == "1" ]]; then
+      if [[ "${run_excluded_exec[$j]}" == "1" ]]; then
+        display_hash="<excluded executable program>"
+      elif [[ "${run_hash_valid[$j]}" == "1" ]]; then
         local hash="${run_hashes[$j]}"
         display_hash="$hash"
         if [[ -n "$prev_hash" && "$hash" == "$prev_hash" ]]; then
@@ -502,11 +696,14 @@ print_dedupe_group() {
       fi
 
       if [[ "$quiet" != "true" || "$is_duplicate" == "true" ]]; then
+        local italicize="false"
         if [[ "${run_moved_flags[$j]}" == "1" ]]; then
-          printf "%b%-*s%b  %b\n" "$italic" "$max_name_len" "$display_name" "$reset" "$display_hash"
-        else
-          printf "%-*s  %b\n" "$max_name_len" "$display_name" "$display_hash"
+          italicize="true"
         fi
+
+        local formatted_name
+        formatted_name="$(format_name_field "$display_name" "$display_hash" "$max_name_len" "$italicize")"
+        printf "%s%b\n" "$formatted_name" "$display_hash"
       fi
     done
   }
@@ -599,6 +796,7 @@ print_dedupe_group() {
     run_files=()
     run_hashes=()
     run_hash_valid=()
+    run_excluded_exec=()
     run_basenames=()
     run_mtimes=()
     run_mtime_valid=()
@@ -611,7 +809,10 @@ print_dedupe_group() {
 
       local hash_valid="0"
       local hash=""
-      if hash="$(try_hash_file "$file")"; then
+      local excluded_exec="0"
+      if is_executable_program_for_dedupe "$file"; then
+        excluded_exec="1"
+      elif hash="$(try_hash_file "$file")"; then
         hash_valid="1"
       fi
 
@@ -624,6 +825,7 @@ print_dedupe_group() {
       run_files+=("$file")
       run_hashes+=("$hash")
       run_hash_valid+=("$hash_valid")
+      run_excluded_exec+=("$excluded_exec")
       run_basenames+=("$base_name")
       run_mtimes+=("$mtime")
       run_mtime_valid+=("$mtime_valid")
@@ -739,7 +941,10 @@ print_dedupe_group() {
 
     local hash_valid="0"
     local hash=""
-    if hash="$(try_hash_file "$file")"; then
+    local excluded_exec="0"
+    if is_executable_program_for_dedupe "$file"; then
+      excluded_exec="1"
+    elif hash="$(try_hash_file "$file")"; then
       hash_valid="1"
     fi
 
@@ -756,13 +961,18 @@ print_dedupe_group() {
         run_files+=("$file")
         run_hashes+=("$hash")
         run_hash_valid+=("1")
+        run_excluded_exec+=("0")
         run_basenames+=("$base_name")
         run_mtimes+=("$mtime")
         run_mtime_valid+=("$mtime_valid")
         run_moved_flags+=("0")
       else
         if [[ "$quiet" != "true" ]]; then
-          printf "%-*s  %s\n" "$max_name_len" "$file" "<hash unavailable>"
+          if [[ "$excluded_exec" == "1" ]]; then
+            printf "%-*s  %s\n" "$max_name_len" "$file" "<excluded executable program>"
+          else
+            printf "%-*s  %s\n" "$max_name_len" "$file" "<hash unavailable>"
+          fi
         fi
       fi
       continue
@@ -772,6 +982,7 @@ print_dedupe_group() {
       run_files+=("$file")
       run_hashes+=("")
       run_hash_valid+=("0")
+      run_excluded_exec+=("$excluded_exec")
       run_basenames+=("$base_name")
       run_mtimes+=("$mtime")
       run_mtime_valid+=("$mtime_valid")
@@ -783,6 +994,7 @@ print_dedupe_group() {
       run_files+=("$file")
       run_hashes+=("$hash")
       run_hash_valid+=("1")
+      run_excluded_exec+=("0")
       run_basenames+=("$base_name")
       run_mtimes+=("$mtime")
       run_mtime_valid+=("$mtime_valid")
@@ -797,6 +1009,7 @@ print_dedupe_group() {
     run_files=("$file")
     run_hashes=("$hash")
     run_hash_valid=("1")
+    run_excluded_exec=("0")
     run_basenames=("$base_name")
     run_mtimes=("$mtime")
     run_mtime_valid=("$mtime_valid")
@@ -920,6 +1133,8 @@ walk_recursive_and_process() {
 }
 
 parse_args "$@"
+
+detect_console_width
 
 algorithm="$(printf '%s' "$algorithm" | tr '[:upper:]' '[:lower:]')"
 dedupe_mode="$(printf '%s' "$dedupe_mode" | tr '[:upper:]' '[:lower:]')"

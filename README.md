@@ -252,6 +252,7 @@ When dedupe is enabled:
 - Primary use case: remove copy/restore/merge artifacts where duplicate files usually sort next to each other (for example names containing `(copy)`, version suffixes, or sync-conflict tags).
 - Duplicate groups are determined by contiguous same-hash blocks in alphabetical listing order within each directory.
 - Files that cannot be hashed are skipped for block matching, so they do not break a contiguous duplicate block among hashable neighbors.
+- Genuine executable program files are excluded from dedupe matching and never moved (requires both execute permission and a program MIME type such as `application/x-pie-executable`).
 - One file is kept in place based on selected mode.
 - All other duplicates in that directory are moved to that directory's `.dups/` subdirectory.
 - In recursive mode, dedupe is still per directory encountered during traversal.
