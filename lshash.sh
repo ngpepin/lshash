@@ -29,7 +29,7 @@ current_subdirs=()
 
 print_help() {
   cat <<'HELP'
-Usage: lshash.sh [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [--all-directory] [-q|--quiet] [DIRECTORY]
+Usage: lshash.sh [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [--all-directory] [--prompt-delete] [-q|--quiet] [DIRECTORY]
 
 NAME can be one of:
   blake3, sha256, sha512, sha1, md5, blake2
@@ -43,8 +43,11 @@ Options:
       --exclude=PATTERN      Exclude files matching PATTERN (repeatable)
   -d, --dedupe [MODE]        Dedupe files with same hash in each directory
       --dedupe=MODE          Keep one file by MODE, move others to .dups/
+                 Valid MODE values: newer, older, shorter, longer
       --all-directory        With -d, dedupe all files in directory by hash
-        --prompt-delete        After listing .dups directories, prompt y/N to delete them
+      --prompt-delete        With -d, after listing .dups directories, prompt y/N to delete them.
+                 Used alone (or with only DIRECTORY), recursively gather existing
+                 .dups directories, list them, and prompt y/N to delete them.
   -q, --quiet                Only print duplicate (green) file lines
 
 Short-option stacking:
@@ -61,6 +64,8 @@ Examples:
   lshash.sh -r --dedupe newer
   lshash.sh --dedupe=longer
   lshash.sh -dr newer
+  lshash.sh --prompt-delete
+  lshash.sh --prompt-delete /path/to/scan
   lshash.sh -rq /path/to/scan
 HELP
 }
@@ -446,16 +451,104 @@ prompt_delete_dups_directories() {
   done < <(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)
 }
 
+print_existing_dups_directories() {
+  local green=$'\033[32m'
+  local reset=$'\033[0m'
+
+  if (( ${#dups_dirs[@]} == 0 )); then
+    printf '%b%s%b\n' "$green" "No .dups directories were found." "$reset"
+    return
+  fi
+
+  local dir
+  while IFS= read -r dir; do
+    [[ -z "$dir" ]] && continue
+    printf '%b%s%b\n' "$green" "$dir" "$reset"
+  done < <(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)
+}
+
+is_prompt_delete_garbage_collect_mode() {
+  [[ "$prompt_delete" == "true" ]] || return 1
+  [[ "$dedupe_enabled" == "false" ]] || return 1
+  [[ "$recursive" == "false" ]] || return 1
+  [[ "$quiet" == "false" ]] || return 1
+  [[ "$all_directory" == "false" ]] || return 1
+  (( ${#exclude_patterns[@]} == 0 )) || return 1
+
+  local normalized_algorithm
+  normalized_algorithm="$(printf '%s' "$algorithm" | tr '[:upper:]' '[:lower:]')"
+  [[ "$normalized_algorithm" == "blake3" ]]
+}
+
+gather_existing_dups_directories() {
+  dups_dirs=()
+
+  local stack=(".")
+  while (( ${#stack[@]} > 0 )); do
+    local dir_rel="${stack[$(( ${#stack[@]} - 1 ))]}"
+    unset 'stack[$(( ${#stack[@]} - 1 ))]'
+
+    local search_dir="$dir_rel"
+    local names=()
+    local candidate
+    shopt -s nullglob dotglob
+    for candidate in "$search_dir"/*; do
+      [[ -d "$candidate" ]] || continue
+      [[ -L "$candidate" ]] && continue
+      local base_name="${candidate##*/}"
+      if [[ "$base_name" == ".dups" ]]; then
+        local dups_rel
+        if [[ "$dir_rel" == "." ]]; then
+          dups_rel=".dups"
+        else
+          dups_rel="$dir_rel/.dups"
+        fi
+        remember_dups_dir "$dups_rel"
+        continue
+      fi
+
+      names+=("$base_name")
+    done
+    shopt -u nullglob dotglob
+
+    local sorted_names=()
+    local name
+    if (( ${#names[@]} > 0 )); then
+      while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        sorted_names+=("$name")
+      done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort)
+    fi
+
+    local i
+    for (( i=${#sorted_names[@]}-1; i>=0; i-- )); do
+      local sub="${sorted_names[$i]}"
+      if [[ "$dir_rel" == "." ]]; then
+        stack+=("$sub")
+      else
+        stack+=("$dir_rel/$sub")
+      fi
+    done
+  done
+}
+
 is_program_mime_type() {
   local mime_type="$1"
+  local normalized
 
-  case "$mime_type" in
-    application/x-executable|application/x-pie-executable|application/x-mach-binary|application/x-dosexec|application/vnd.microsoft.portable-executable)
+  normalized="$(printf '%s' "$mime_type" | tr '[:upper:]' '[:lower:]')"
+
+  case "$normalized" in
+    application/x-executable|application/x-pie-executable|application/x-mach-binary|application/x-dosexec|application/vnd.microsoft.portable-executable|application/x-shellscript|text/x-shellscript|text/x-python|text/x-perl|text/x-ruby|text/x-php|text/x-lua|text/x-tcl)
       return 0
       ;;
   esac
 
-  if [[ "$mime_type" == application/*program* ]]; then
+  if [[ "$normalized" == application/*program* ]]; then
+    return 0
+  fi
+
+  if [[ "$normalized" == text/x-*script* ]]; then
     return 0
   fi
 
@@ -484,10 +577,19 @@ has_any_execute_permission_bit() {
   return 1
 }
 
+has_shebang_prefix() {
+  local file="$1"
+  local prefix
+
+  prefix="$(head -c 2 -- "$file" 2>/dev/null || true)"
+  [[ "$prefix" == '#!' ]]
+}
+
 is_executable_program_for_dedupe() {
   local file="$1"
 
   has_any_execute_permission_bit "$file" || return 1
+  has_shebang_prefix "$file" && return 0
   command -v file >/dev/null 2>&1 || return 1
 
   local mime_type
@@ -1208,6 +1310,18 @@ walk_recursive_and_process() {
 
 parse_args "$@"
 
+if ! cd -- "$target_dir"; then
+  echo "Cannot access directory: $target_dir" >&2
+  exit 1
+fi
+
+if is_prompt_delete_garbage_collect_mode; then
+  gather_existing_dups_directories
+  print_existing_dups_directories
+  prompt_delete_dups_directories
+  exit 0
+fi
+
 detect_console_width
 
 algorithm="$(printf '%s' "$algorithm" | tr '[:upper:]' '[:lower:]')"
@@ -1265,11 +1379,6 @@ if ! command -v "$hash_cmd" >/dev/null 2>&1; then
   fi
 fi
 
-if ! cd -- "$target_dir"; then
-  echo "Cannot access directory: $target_dir" >&2
-  exit 1
-fi
-
 if [[ "$recursive" == "true" ]]; then
   walk_recursive_and_process
 else
@@ -1283,6 +1392,6 @@ if [[ "$dedupe_enabled" == "true" ]]; then
   print_dups_directories
 fi
 
-if [[ "$prompt_delete" == "true" ]]; then
+if [[ "$dedupe_enabled" == "true" && "$prompt_delete" == "true" ]]; then
   prompt_delete_dups_directories
 fi

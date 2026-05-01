@@ -65,7 +65,12 @@ run_impl() {
   local err_file="$3"
   shift 3
 
-  (cd "$work_dir" && "$@") > "$out_file" 2> "$err_file" || true
+  # Force non-interactive execution so prompt-delete paths don't block in CI/regression runs.
+  if command -v setsid >/dev/null 2>&1; then
+    (cd "$work_dir" && setsid "$@" < /dev/null) > "$out_file" 2> "$err_file" || true
+  else
+    (cd "$work_dir" && "$@" < /dev/null) > "$out_file" 2> "$err_file" || true
+  fi
 }
 
 run_pair() {
@@ -159,6 +164,29 @@ setup_executable_program_exclusion() {
   cp "$DOTNET_IMPL" "$root/prog-b"
 }
 
+setup_executable_script_exclusion() {
+  local root="$1"
+  printf 'same\n' > "$root/a.txt"
+  cp "$root/a.txt" "$root/aa.txt"
+
+  cat > "$root/script-a.sh" <<'SCRIPT'
+#!/usr/bin/env sh
+echo hi
+SCRIPT
+  cp "$root/script-a.sh" "$root/script-b.sh"
+  chmod +x "$root/script-a.sh" "$root/script-b.sh"
+}
+
+setup_prompt_delete_gc_tree() {
+  local root="$1"
+  mkdir -p "$root/scan/x/.dups"
+  mkdir -p "$root/scan/y/z/.dups"
+  mkdir -p "$root/outside/.dups"
+  printf 'trash\n' > "$root/scan/x/.dups/a.txt"
+  printf 'trash\n' > "$root/scan/y/z/.dups/b.txt"
+  printf 'trash\n' > "$root/outside/.dups/c.txt"
+}
+
 main() {
   ensure_dotnet_binary
 
@@ -175,6 +203,25 @@ main() {
   assert_contains "$case_dir/bash.clean" "sub/b.txt" "quiet recursive mode should show duplicate line"
   assert_not_contains "$case_dir/bash.clean" "sub/a.txt" "quiet recursive mode should hide non-duplicate first line"
   assert_contains "$case_dir/bash.clean" "2 directories were traversed." "recursive summary should report directories traversed"
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "prompt-delete no-op with extra option" setup_quiet_non_recursive --algorithm=sha256 --prompt-delete)"
+  assert_not_contains "$case_dir/bash.clean" "No duplicates were moved into .dups directories." "--prompt-delete without -d should not trigger dedupe post-summary output"
+  assert_contains "$case_dir/bash.clean" "Summary: scanned 3 file(s); 1 duplicate file(s) were found (33.33% of scanned files)." "--prompt-delete with extra options should keep normal scanning behavior"
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "prompt-delete gc from current directory" setup_prompt_delete_gc_tree --prompt-delete)"
+  assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/outside/.dups" "--prompt-delete alone should discover root-level .dups directories recursively"
+  assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/scan/x/.dups" "--prompt-delete alone should discover nested .dups directories recursively"
+  assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/scan/y/z/.dups" "--prompt-delete alone should discover deeply nested .dups directories recursively"
+  assert_not_contains "$case_dir/bash.clean" "Summary: scanned" "--prompt-delete standalone gc mode should not perform file scan summary"
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "prompt-delete gc scoped to directory argument" setup_prompt_delete_gc_tree --prompt-delete scan)"
+  assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/scan/x/.dups" "--prompt-delete DIRECTORY should include .dups under DIRECTORY"
+  assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/scan/y/z/.dups" "--prompt-delete DIRECTORY should include nested .dups under DIRECTORY"
+  assert_not_contains "$case_dir/bash.clean" "<CASE_ROOT>/outside/.dups" "--prompt-delete DIRECTORY should not include .dups outside DIRECTORY"
+  assert_not_contains "$case_dir/bash.clean" "Summary: scanned" "--prompt-delete DIRECTORY gc mode should not perform file scan summary"
   rm -rf "$case_dir"
 
   case_dir="$(run_pair "quiet dedupe" setup_quiet_dedupe --algorithm=sha256 -d shorter -q)"
@@ -243,6 +290,16 @@ main() {
   [[ -f "$case_dir/dotnetcase/.dups/aa.txt" ]] || { echo "Assertion failed: dotnet regular duplicate should still be moved" >&2; exit 1; }
   [[ ! -f "$case_dir/bashcase/.dups/prog-b" ]] || { echo "Assertion failed: bash should not move excluded executable program" >&2; exit 1; }
   [[ ! -f "$case_dir/dotnetcase/.dups/prog-b" ]] || { echo "Assertion failed: dotnet should not move excluded executable program" >&2; exit 1; }
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "dedupe excludes executable scripts" setup_executable_script_exclusion --algorithm=sha256 -d shorter --all-directory)"
+  assert_contains "$case_dir/bash.clean" "script-a.sh" "executable script entries should still be listed"
+  assert_contains "$case_dir/bash.clean" "<excluded executable program>" "executable script entries should be explicitly excluded from dedupe"
+  assert_not_contains "$case_dir/bash.clean" "script-b.sh (moved to .dups/)" "executable scripts should not be moved by dedupe"
+  [[ -f "$case_dir/bashcase/.dups/aa.txt" ]] || { echo "Assertion failed: regular duplicate should still be moved with executable scripts present" >&2; exit 1; }
+  [[ -f "$case_dir/dotnetcase/.dups/aa.txt" ]] || { echo "Assertion failed: dotnet regular duplicate should still be moved with executable scripts present" >&2; exit 1; }
+  [[ ! -f "$case_dir/bashcase/.dups/script-b.sh" ]] || { echo "Assertion failed: bash should not move excluded executable script" >&2; exit 1; }
+  [[ ! -f "$case_dir/dotnetcase/.dups/script-b.sh" ]] || { echo "Assertion failed: dotnet should not move excluded executable script" >&2; exit 1; }
   rm -rf "$case_dir"
 
   echo "All regression checks passed."

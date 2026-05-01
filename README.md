@@ -146,11 +146,15 @@ dotnet run -c Release -- --help
 
 ### .NET options
 
-The .NET implementation supports the same options as Bash (`--algorithm`, `-r/--recursive`, `-e/--exclude`, `-d/--dedupe`, `--all-directory`, `-q/--quiet`, optional `DIRECTORY`):
+The .NET implementation supports the same options as Bash (`--algorithm`, `-r/--recursive`, `-e/--exclude`, `-d/--dedupe`, `--all-directory`, `--prompt-delete`, `-q/--quiet`, optional `DIRECTORY`):
 
 - `--all-directory`
   - With `-d/--dedupe`, dedupe by hash across all files in each directory, ignoring filename adjacency
   - Without `-d/--dedupe`, this flag is a no-op
+- `--prompt-delete`
+  - With `-d/--dedupe`, after listing `.dups` directories, prompts `y/N` to delete them
+  - Used alone (or with only `DIRECTORY`), recursively gathers existing `.dups` directories, lists them, and prompts `y/N` to delete them
+  - When combined with other non-dedupe options, this flag is a no-op
 
 ### .NET BLAKE3 backend selection
 
@@ -171,12 +175,15 @@ dotnet/dist/linux-x64/lshash -rq /path/to/scan
 dotnet/dist/linux-x64/lshash -r -d shorter -q
 dotnet/dist/linux-x64/lshash --all-directory            # no-op without -d
 dotnet/dist/linux-x64/lshash -d shorter --all-directory
+dotnet/dist/linux-x64/lshash -d shorter --prompt-delete
+dotnet/dist/linux-x64/lshash --prompt-delete
+dotnet/dist/linux-x64/lshash --prompt-delete /path/to/scan
 ```
 
 ## Usage
 
 ```bash
-./lshash.sh [--algorithm NAME] [-r|--recursive] [-e PATTERN] [--exclude PATTERN] [-d [MODE]] [--all-directory] [-q|--quiet] [DIRECTORY]
+./lshash.sh [--algorithm NAME] [-r|--recursive] [-e PATTERN] [--exclude PATTERN] [-d [MODE]] [--all-directory] [--prompt-delete] [-q|--quiet] [DIRECTORY]
 ```
 
 ## macOS execution quick guide
@@ -222,11 +229,15 @@ cd dotnet/deploy/macos
 - `-d [MODE]`, `--dedupe [MODE]`, `--dedup [MODE]`
 - `-d=MODE`, `--dedupe=MODE`, `--dedup=MODE`
   - Dedupe files with identical hash in the same directory
-  - Modes: `newer`, `older`, `shorter`, `longer`
+  - Valid `MODE` values: `newer`, `older`, `shorter`, `longer`
   - Default mode when omitted: `shorter`
 - `--all-directory`
   - With `-d/--dedupe`, uses full-directory hash grouping instead of contiguous-neighbor grouping
   - Without `-d/--dedupe`, no-op
+- `--prompt-delete`
+  - With `-d/--dedupe`, after printing `.dups` directory paths, prompts `y/N` to delete them
+  - Used alone (or with only `DIRECTORY`), recursively gathers existing `.dups` directories, lists them, and prompts `y/N` to delete them
+  - When combined with other non-dedupe options, no-op
 - `-q`, `--quiet`
   - Only print duplicate lines (the lines that would be highlighted green in normal output)
   - Works with and without dedupe, and with and without recursive mode
@@ -252,7 +263,7 @@ When dedupe is enabled:
 - Primary use case: remove copy/restore/merge artifacts where duplicate files usually sort next to each other (for example names containing `(copy)`, version suffixes, or sync-conflict tags).
 - Duplicate groups are determined by contiguous same-hash blocks in alphabetical listing order within each directory.
 - Files that cannot be hashed are skipped for block matching, so they do not break a contiguous duplicate block among hashable neighbors.
-- Genuine executable program files are excluded from dedupe matching and never moved (requires both execute permission and a program MIME type such as `application/x-pie-executable`).
+- Genuine executable program files are excluded from dedupe matching and never moved (requires execute permission plus program/script detection, for example MIME types such as `application/x-pie-executable` or `text/x-shellscript`; shebang scripts are also treated as executable programs even if MIME resolves to `text/plain`; many file managers show these as `Program`).
 - One file is kept in place based on selected mode.
 - All other duplicates in that directory are moved to that directory's `.dups/` subdirectory.
 - In recursive mode, dedupe is still per directory encountered during traversal.
@@ -330,6 +341,13 @@ flowchart TD
 ```bash
 ./lshash.sh -q
 ./lshash.sh -rq /path/to/scan
+```
+
+### Prompt-delete garbage collection mode
+
+```bash
+./lshash.sh --prompt-delete
+./lshash.sh --prompt-delete /path/to/scan
 ```
 
 ### Summary message examples (hypothetical)

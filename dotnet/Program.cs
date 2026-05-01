@@ -187,6 +187,13 @@ internal static class Program
             }
 
             WorkingDirectory = ResolveWorkingDirectory(options.RootDirectory);
+
+            if (IsPromptDeleteGarbageCollectMode(options))
+            {
+                RunPromptDeleteGarbageCollectMode();
+                return 0;
+            }
+
             var summaryStats = new SummaryStats();
 
             if (options.Recursive)
@@ -490,7 +497,7 @@ internal static class Program
     {
         Console.WriteLine(
             """
-            Usage: lshash [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [-q|--quiet] [DIRECTORY]
+            Usage: lshash [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [--all-directory] [--prompt-delete] [-q|--quiet] [DIRECTORY]
 
             NAME can be one of:
               blake3, sha256, sha512, sha1, md5, blake2
@@ -504,8 +511,11 @@ internal static class Program
                   --exclude=PATTERN      Exclude files matching PATTERN (repeatable)
               -d, --dedupe [MODE]        Dedupe files with same hash in each directory
                   --dedupe=MODE          Keep one file by MODE, move others to .dups/
+                                          Valid MODE values: newer, older, shorter, longer
               --all-directory            With -d, dedupe using all files in directory by hash (ignores filename adjacency)
-              --prompt-delete            After listing .dups directories, prompt y/N to delete them
+              --prompt-delete            With -d, after listing .dups directories, prompt y/N to delete them.
+                                          When used alone (or with only DIRECTORY), recursively gather existing .dups directories,
+                                          list them, and prompt y/N to delete them.
               -q, --quiet                Only print duplicate (green) file lines
 
             Short-option stacking:
@@ -521,10 +531,83 @@ internal static class Program
               lshash -r --dedupe newer
               lshash -d --all-directory
               lshash --dedupe=longer
+                            lshash --prompt-delete
+                            lshash --prompt-delete /path/to/scan
               lshash -dr newer
               lshash -rq /path/to/scan
             """
         );
+    }
+
+    private static bool IsPromptDeleteGarbageCollectMode(Options options)
+    {
+        return options.PromptDelete
+            && !options.DedupeEnabled
+            && !options.Recursive
+            && options.ExcludePatterns.Count == 0
+            && !options.Quiet
+            && !options.AllDirectoryDedupe
+            && options.Algorithm == HashAlgorithmKind.Blake3;
+    }
+
+    private static void RunPromptDeleteGarbageCollectMode()
+    {
+        var dupsDirectories = CollectExistingDupsDirectories();
+        if (dupsDirectories.Count == 0)
+        {
+            Console.WriteLine($"{Green}No .dups directories were found.{Reset}");
+            return;
+        }
+
+        foreach (var dupsDir in dupsDirectories.OrderBy(path => path, StringComparer.Ordinal))
+        {
+            Console.WriteLine($"{Green}{dupsDir}{Reset}");
+        }
+
+        PromptDeleteDupsDirectories(dupsDirectories);
+    }
+
+    private static HashSet<string> CollectExistingDupsDirectories()
+    {
+        var dupsDirectories = new HashSet<string>(StringComparer.Ordinal);
+        var stack = new Stack<string>();
+        stack.Push(WorkingDirectory);
+
+        while (stack.Count > 0)
+        {
+            var currentDirectory = stack.Pop();
+            List<string> subDirectories;
+            try
+            {
+                subDirectories = Directory
+                    .EnumerateDirectories(currentDirectory)
+                    .Where(path => !IsSymlink(path))
+                    .OrderBy(path => Path.GetFileName(path), StringComparer.Ordinal)
+                    .ToList();
+            }
+            catch (Exception ex)
+            {
+                var displayPath = string.Equals(currentDirectory, WorkingDirectory, StringComparison.Ordinal)
+                    ? "."
+                    : ToUnixRelativePath(currentDirectory);
+                Warn("enumerate directories", displayPath, ex.Message);
+                continue;
+            }
+
+            for (var i = subDirectories.Count - 1; i >= 0; i--)
+            {
+                var subDirectory = subDirectories[i];
+                if (string.Equals(Path.GetFileName(subDirectory), ".dups", StringComparison.Ordinal))
+                {
+                    dupsDirectories.Add(subDirectory);
+                    continue;
+                }
+
+                stack.Push(subDirectory);
+            }
+        }
+
+        return dupsDirectories;
     }
 
     private static void ProcessRecursive(Options options, SummaryStats summaryStats)
@@ -902,9 +985,9 @@ internal static class Program
             PrintDupsDirectories(summaryStats);
         }
 
-        if (options.PromptDelete)
+        if (options.DedupeEnabled && options.PromptDelete)
         {
-            PromptDeleteDupsDirectories(summaryStats);
+            PromptDeleteDupsDirectories(summaryStats.DupsDirectories);
         }
     }
 
@@ -922,9 +1005,9 @@ internal static class Program
         }
     }
 
-    private static void PromptDeleteDupsDirectories(SummaryStats summaryStats)
+    private static void PromptDeleteDupsDirectories(ICollection<string> dupsDirectories)
     {
-        if (summaryStats.DupsDirectories.Count == 0)
+        if (dupsDirectories.Count == 0)
         {
             return;
         }
@@ -942,7 +1025,7 @@ internal static class Program
             return;
         }
 
-        foreach (var dupsDir in summaryStats.DupsDirectories.OrderBy(path => path, StringComparer.Ordinal))
+        foreach (var dupsDir in dupsDirectories.OrderBy(path => path, StringComparer.Ordinal))
         {
             try
             {
@@ -1009,7 +1092,31 @@ internal static class Program
             return false;
         }
 
+        if (HasShebangPrefix(absolutePath))
+        {
+            return true;
+        }
+
         return TryGetMimeType(absolutePath, out var mimeType) && IsProgramMimeType(mimeType);
+    }
+
+    private static bool HasShebangPrefix(string filePath)
+    {
+        try
+        {
+            using var stream = File.OpenRead(filePath);
+            Span<byte> firstTwo = stackalloc byte[2];
+            if (stream.Read(firstTwo) < 2)
+            {
+                return false;
+            }
+
+            return firstTwo[0] == (byte)'#' && firstTwo[1] == (byte)'!';
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static bool HasAnyExecuteBit(string filePath)
@@ -1074,13 +1181,25 @@ internal static class Program
 
     private static bool IsProgramMimeType(string mimeType)
     {
-        return mimeType.Equals("application/x-executable", StringComparison.OrdinalIgnoreCase)
-            || mimeType.Equals("application/x-pie-executable", StringComparison.OrdinalIgnoreCase)
-            || mimeType.Equals("application/x-mach-binary", StringComparison.OrdinalIgnoreCase)
-            || mimeType.Equals("application/x-dosexec", StringComparison.OrdinalIgnoreCase)
-            || mimeType.Equals("application/vnd.microsoft.portable-executable", StringComparison.OrdinalIgnoreCase)
-            || (mimeType.StartsWith("application/", StringComparison.OrdinalIgnoreCase)
-                && mimeType.Contains("program", StringComparison.OrdinalIgnoreCase));
+        var normalized = mimeType.Trim().ToLowerInvariant();
+
+        return normalized is "application/x-executable"
+            or "application/x-pie-executable"
+            or "application/x-mach-binary"
+            or "application/x-dosexec"
+            or "application/vnd.microsoft.portable-executable"
+            or "application/x-shellscript"
+            or "text/x-shellscript"
+            or "text/x-python"
+            or "text/x-perl"
+            or "text/x-ruby"
+            or "text/x-php"
+            or "text/x-lua"
+            or "text/x-tcl"
+            || (normalized.StartsWith("application/", StringComparison.Ordinal)
+                && normalized.Contains("program", StringComparison.Ordinal))
+            || (normalized.StartsWith("text/x-", StringComparison.Ordinal)
+                && normalized.Contains("script", StringComparison.Ordinal));
     }
 
     private static bool ShouldReplace(FileEntry candidate, FileEntry current, DedupeMode mode)
