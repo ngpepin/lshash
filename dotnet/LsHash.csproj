@@ -6,7 +6,13 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>lshash</AssemblyName>
     <RootNamespace>LsHash</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.Globalization.Invariant" Value="true" />
+    <RuntimeHostConfigurationOption Include="System.Globalization.PredefinedCulturesOnly" Value="true" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.4.0" />

@@ -101,6 +101,7 @@ Output executable:
 - `dotnet/dist/linux-x64/lshash`
 
 The publish configuration is self-contained and single-file, so no .NET runtime is required on the target host.
+The .NET build also enables invariant globalization, so `libicu` is not required on minimal Linux containers.
 
 ### Build native macOS self-contained binaries
 
