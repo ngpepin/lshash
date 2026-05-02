@@ -177,6 +177,15 @@ SCRIPT
   chmod +x "$root/script-a.sh" "$root/script-b.sh"
 }
 
+setup_long_name_duplicate_pair() {
+  local root="$1"
+  local long_a="this_is_a_very_long_filename_that_should_be_truncated_and_keep_suffix_a.txt"
+  local long_b="this_is_a_very_long_filename_that_should_be_truncated_and_keep_suffix_b.txt"
+
+  printf 'same\n' > "$root/$long_a"
+  cp "$root/$long_a" "$root/$long_b"
+}
+
 setup_prompt_delete_gc_tree() {
   local root="$1"
   mkdir -p "$root/scan/x/.dups"
@@ -185,6 +194,14 @@ setup_prompt_delete_gc_tree() {
   printf 'trash\n' > "$root/scan/x/.dups/a.txt"
   printf 'trash\n' > "$root/scan/y/z/.dups/b.txt"
   printf 'trash\n' > "$root/outside/.dups/c.txt"
+}
+
+setup_global_recursive_cross_directory() {
+  local root="$1"
+  mkdir -p "$root/sub"
+  printf 'same\n' > "$root/keep.txt"
+  cp "$root/keep.txt" "$root/sub/this_is_a_significantly_longer_duplicate_filename.txt"
+  printf 'unique\n' > "$root/sub/unique.txt"
 }
 
 main() {
@@ -258,18 +275,65 @@ main() {
 
   rm -rf "$tmpdir"
 
-  case_dir="$(run_pair "all-directory no-op without dedupe" setup_all_directory_non_adjacent --algorithm=sha256 --all-directory)"
-  assert_contains "$case_dir/bash.clean" "a-copy.txt" "--all-directory without -d should keep normal listing behavior"
-  assert_contains "$case_dir/bash.clean" "z-sync-conflict.txt" "--all-directory without -d should not suppress files"
-  [[ ! -d "$case_dir/bashcase/.dups" ]] || { echo "Assertion failed: bash --all-directory without -d should not dedupe" >&2; exit 1; }
-  [[ ! -d "$case_dir/dotnetcase/.dups" ]] || { echo "Assertion failed: dotnet --all-directory without -d should not dedupe" >&2; exit 1; }
+  case_dir="$(run_pair "directory no-op without dedupe" setup_all_directory_non_adjacent --algorithm=sha256 --directory)"
+  assert_contains "$case_dir/bash.clean" "a-copy.txt" "--directory without -d should keep normal listing behavior"
+  assert_contains "$case_dir/bash.clean" "z-sync-conflict.txt" "--directory without -d should not suppress files"
+  [[ ! -d "$case_dir/bashcase/.dups" ]] || { echo "Assertion failed: bash --directory without -d should not dedupe" >&2; exit 1; }
+  [[ ! -d "$case_dir/dotnetcase/.dups" ]] || { echo "Assertion failed: dotnet --directory without -d should not dedupe" >&2; exit 1; }
   rm -rf "$case_dir"
 
-  case_dir="$(run_pair "all-directory dedupe non-adjacent" setup_all_directory_non_adjacent --algorithm=sha256 -d shorter --all-directory)"
-  assert_contains "$case_dir/bash.clean" "z-sync-conflict.txt (moved to .dups/)" "--all-directory with -d should dedupe non-adjacent duplicates"
-  [[ -f "$case_dir/bashcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: bash --all-directory with -d should move duplicate" >&2; exit 1; }
-  [[ -f "$case_dir/dotnetcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: dotnet --all-directory with -d should move duplicate" >&2; exit 1; }
+  case_dir="$(run_pair "directory dedupe non-adjacent" setup_all_directory_non_adjacent --algorithm=sha256 -d shorter --directory)"
+  assert_contains "$case_dir/bash.clean" "z-sync-conflict.txt (moved to .dups/)" "--directory with -d should dedupe non-adjacent duplicates"
+  [[ -f "$case_dir/bashcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: bash --directory with -d should move duplicate" >&2; exit 1; }
+  [[ -f "$case_dir/dotnetcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: dotnet --directory with -d should move duplicate" >&2; exit 1; }
   rm -rf "$case_dir"
+
+  case_dir="$(run_pair "all-directory alias compatibility" setup_all_directory_non_adjacent --algorithm=sha256 -d shorter --all-directory)"
+  assert_contains "$case_dir/bash.clean" "z-sync-conflict.txt (moved to .dups/)" "--all-directory alias should remain compatible"
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "global without dedupe no-op" setup_all_directory_non_adjacent --algorithm=sha256 --global)"
+  assert_contains "$case_dir/bash.clean" "a-copy.txt" "--global without -d should keep normal listing behavior"
+  [[ ! -d "$case_dir/bashcase/.dups" ]] || { echo "Assertion failed: bash --global without -d should not dedupe" >&2; exit 1; }
+  [[ ! -d "$case_dir/dotnetcase/.dups" ]] || { echo "Assertion failed: dotnet --global without -d should not dedupe" >&2; exit 1; }
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "global non-rec behaves all-directory" setup_all_directory_non_adjacent --algorithm=sha256 -d shorter --global)"
+  assert_contains "$case_dir/bash.clean" "z-sync-conflict.txt (moved to .dups/)" "--global with -d should dedupe non-adjacent duplicates in non-recursive mode"
+  [[ -f "$case_dir/bashcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: bash --global non-recursive should move duplicate" >&2; exit 1; }
+  [[ -f "$case_dir/dotnetcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: dotnet --global non-recursive should move duplicate" >&2; exit 1; }
+  [[ ! -f "$case_dir/bashcase/.dups/z-sync-conflict.txt.json" ]] || { echo "Assertion failed: bash --global non-recursive should not write metadata json" >&2; exit 1; }
+  [[ ! -f "$case_dir/dotnetcase/.dups/z-sync-conflict.txt.json" ]] || { echo "Assertion failed: dotnet --global non-recursive should not write metadata json" >&2; exit 1; }
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "global recursive cross-directory" setup_global_recursive_cross_directory --algorithm=sha256 -r -d shorter --global)"
+  assert_contains "$case_dir/bash.clean" "sub/this_is_a_significantly_longer_duplicate_filename.txt (moved to .dups/)" "--global recursive should dedupe across directories and move loser in-place"
+  [[ -f "$case_dir/bashcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt" ]] || { echo "Assertion failed: bash --global recursive should move duplicate into source directory .dups" >&2; exit 1; }
+  [[ -f "$case_dir/dotnetcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt" ]] || { echo "Assertion failed: dotnet --global recursive should move duplicate into source directory .dups" >&2; exit 1; }
+  [[ -f "$case_dir/bashcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" ]] || { echo "Assertion failed: bash --global recursive should write metadata json" >&2; exit 1; }
+  [[ -f "$case_dir/dotnetcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" ]] || { echo "Assertion failed: dotnet --global recursive should write metadata json" >&2; exit 1; }
+  assert_contains "$case_dir/bashcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" "\"status\": \"kept\"" "metadata json should identify kept file"
+  assert_contains "$case_dir/bashcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" "\"status\": \"moved\"" "metadata json should identify moved file"
+  assert_contains "$case_dir/dotnetcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" "\"status\": \"kept\"" "dotnet metadata json should identify kept file"
+  assert_contains "$case_dir/dotnetcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" "\"status\": \"moved\"" "dotnet metadata json should identify moved file"
+  rm -rf "$case_dir"
+
+  tmpdir="$(mktemp -d)"
+  mkdir -p "$tmpdir/bashcase" "$tmpdir/dotnetcase"
+  setup_long_name_duplicate_pair "$tmpdir/bashcase"
+  setup_long_name_duplicate_pair "$tmpdir/dotnetcase"
+
+  run_impl "$tmpdir/bashcase" "$tmpdir/bash.trunc.out" "$tmpdir/bash.trunc.err" env LSHASH_CONSOLE_WIDTH=90 "$BASH_IMPL" --algorithm=sha256 -d shorter --directory
+  run_impl "$tmpdir/dotnetcase" "$tmpdir/dotnet.trunc.out" "$tmpdir/dotnet.trunc.err" env LSHASH_CONSOLE_WIDTH=90 "$DOTNET_IMPL" --algorithm=sha256 -d shorter --directory
+
+  strip_ansi < "$tmpdir/bash.trunc.out" > "$tmpdir/bash.trunc.clean"
+  strip_ansi < "$tmpdir/dotnet.trunc.out" > "$tmpdir/dotnet.trunc.clean"
+  normalize_case_root "$tmpdir/bash.trunc.clean" "$tmpdir/bashcase"
+  normalize_case_root "$tmpdir/dotnet.trunc.clean" "$tmpdir/dotnetcase"
+
+  assert_same_output "$tmpdir/bash.trunc.clean" "$tmpdir/dotnet.trunc.clean" "moved suffix truncation: bash/.NET outputs differ"
+  assert_contains "$tmpdir/bash.trunc.clean" "(moved to .dups/)" "moved marker should remain visible when names are truncated to fit width"
+  rm -rf "$tmpdir"
 
   case_dir="$(run_pair "recursive ignores symlink directories" setup_symlink_directory --algorithm=sha256 -r)"
   assert_not_contains "$case_dir/bash.clean" "linkdir/" "recursive traversal should ignore symlinked directories"
@@ -282,7 +346,7 @@ main() {
   chmod 755 "$case_dir/bashcase/blocked" "$case_dir/dotnetcase/blocked" || true
   rm -rf "$case_dir"
 
-  case_dir="$(run_pair "dedupe excludes executable programs" setup_executable_program_exclusion --algorithm=sha256 -d shorter --all-directory)"
+  case_dir="$(run_pair "dedupe excludes executable programs" setup_executable_program_exclusion --algorithm=sha256 -d shorter --directory)"
   assert_contains "$case_dir/bash.clean" "prog-a" "executable program entries should still be listed"
   assert_contains "$case_dir/bash.clean" "<excluded executable program>" "executable program entries should be explicitly excluded from dedupe"
   assert_not_contains "$case_dir/bash.clean" "prog-b (moved to .dups/)" "executable programs should not be moved by dedupe"
@@ -292,7 +356,7 @@ main() {
   [[ ! -f "$case_dir/dotnetcase/.dups/prog-b" ]] || { echo "Assertion failed: dotnet should not move excluded executable program" >&2; exit 1; }
   rm -rf "$case_dir"
 
-  case_dir="$(run_pair "dedupe excludes executable scripts" setup_executable_script_exclusion --algorithm=sha256 -d shorter --all-directory)"
+  case_dir="$(run_pair "dedupe excludes executable scripts" setup_executable_script_exclusion --algorithm=sha256 -d shorter --directory)"
   assert_contains "$case_dir/bash.clean" "script-a.sh" "executable script entries should still be listed"
   assert_contains "$case_dir/bash.clean" "<excluded executable program>" "executable script entries should be explicitly excluded from dedupe"
   assert_not_contains "$case_dir/bash.clean" "script-b.sh (moved to .dups/)" "executable scripts should not be moved by dedupe"

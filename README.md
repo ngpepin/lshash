@@ -29,7 +29,7 @@ In production RAG systems, duplicate files can create duplicate chunks, increase
 The intended workflow is a staged curation process:
 
 - Phase 1 (audit, no mutation): run without `-d` to profile duplication as part of pre-ingestion assessment. Use the completion statistics to quantify duplicate-file rate before chunking and embedding.
-- Phase 2 (remediation, optional): run with `-d` (and optionally `--all-directory` for full-directory grouping) to quarantine duplicates into `.dups/`, reducing corpus redundancy before indexing.
+- Phase 2 (remediation, optional): run with `-d` (and optionally `--directory` for full-directory grouping) to quarantine duplicates into `.dups/`, reducing corpus redundancy before indexing.
 - Phase 3 (post-curation validation): re-run audit and compare summary metrics to confirm that curation improved corpus quality.
 
 This separation of discovery and action supports safer change control, clearer governance, and repeatable RAG data-preparation practice.
@@ -42,7 +42,7 @@ This separation of discovery and action supports safer change control, clearer g
 
 - Bash implementation:
   - Script: `lshash.sh`
-  - Supports contiguous dedupe and `--all-directory` dedupe
+  - Supports contiguous dedupe and `--directory` dedupe (with `--all-directory` as a compatibility alias)
 - .NET implementation:
   - Project: `dotnet/`
   - Supports the same runtime options and dedupe variants as Bash
@@ -147,10 +147,15 @@ dotnet run -c Release -- --help
 
 ### .NET options
 
-The .NET implementation supports the same options as Bash (`--algorithm`, `-r/--recursive`, `-e/--exclude`, `-d/--dedupe`, `--all-directory`, `--prompt-delete`, `-q/--quiet`, optional `DIRECTORY`):
+The .NET implementation supports the same options as Bash (`--algorithm`, `-r/--recursive`, `-e/--exclude`, `-d/--dedupe`, `--directory` (alias `--all-directory`), `--global`, `--prompt-delete`, `-q/--quiet`, optional `DIRECTORY`):
 
-- `--all-directory`
+- `--directory` (alias: `--all-directory`)
   - With `-d/--dedupe`, dedupe by hash across all files in each directory, ignoring filename adjacency
+  - Without `-d/--dedupe`, this flag is a no-op
+- `--global`
+  - With `-d/--dedupe` and `-r/--recursive`, dedupe by hash across the entire recursive tree
+  - With `-d/--dedupe` without `-r/--recursive`, behaves like `--directory` on the selected directory
+  - Sidecar metadata files `<moved-file>.json` are created only in recursive global mode (`-r -d --global`)
   - Without `-d/--dedupe`, this flag is a no-op
 - `--prompt-delete`
   - With `-d/--dedupe`, after listing `.dups` directories, prompts `y/N` to delete them
@@ -174,8 +179,10 @@ The .NET implementation supports the same options as Bash (`--algorithm`, `-r/--
 dotnet/dist/linux-x64/lshash -q
 dotnet/dist/linux-x64/lshash -rq /path/to/scan
 dotnet/dist/linux-x64/lshash -r -d shorter -q
-dotnet/dist/linux-x64/lshash --all-directory            # no-op without -d
-dotnet/dist/linux-x64/lshash -d shorter --all-directory
+dotnet/dist/linux-x64/lshash --directory                # no-op without -d
+dotnet/dist/linux-x64/lshash -d shorter --directory
+dotnet/dist/linux-x64/lshash -d shorter --global
+dotnet/dist/linux-x64/lshash -r -d shorter --global
 dotnet/dist/linux-x64/lshash -d shorter --prompt-delete
 dotnet/dist/linux-x64/lshash --prompt-delete
 dotnet/dist/linux-x64/lshash --prompt-delete /path/to/scan
@@ -184,7 +191,7 @@ dotnet/dist/linux-x64/lshash --prompt-delete /path/to/scan
 ## Usage
 
 ```bash
-./lshash.sh [--algorithm NAME] [-r|--recursive] [-e PATTERN] [--exclude PATTERN] [-d [MODE]] [--all-directory] [--prompt-delete] [-q|--quiet] [DIRECTORY]
+./lshash.sh [--algorithm NAME] [-r|--recursive] [-e PATTERN] [--exclude PATTERN] [-d [MODE]] [--directory] [--global] [--prompt-delete] [-q|--quiet] [DIRECTORY]
 ```
 
 ## macOS execution quick guide
@@ -232,8 +239,13 @@ cd dotnet/deploy/macos
   - Dedupe files with identical hash in the same directory
   - Valid `MODE` values: `newer`, `older`, `shorter`, `longer`
   - Default mode when omitted: `shorter`
-- `--all-directory`
+- `--directory` (alias: `--all-directory`)
   - With `-d/--dedupe`, uses full-directory hash grouping instead of contiguous-neighbor grouping
+  - Without `-d/--dedupe`, no-op
+- `--global`
+  - With `-d/--dedupe` and `-r/--recursive`, dedupes by hash across all scanned files in the recursive tree (not per-directory)
+  - With `-d/--dedupe` without `-r/--recursive`, behaves like `--directory` for the selected directory
+  - In recursive global mode (`-r -d --global`), each moved duplicate gets a sidecar metadata JSON file `<moved-file>.json` in `.dups/` describing duplicate peers (full paths) and statuses (`kept`/`moved`)
   - Without `-d/--dedupe`, no-op
 - `--prompt-delete`
   - With `-d/--dedupe`, after printing `.dups` directory paths, prompts `y/N` to delete them
@@ -270,28 +282,97 @@ When dedupe is enabled:
 - In recursive mode, dedupe is still per directory encountered during traversal.
 - Tie-breaking rule: first file in sorted listing order is kept.
 - If a destination name already exists in `.dups/`, a `.dupN` suffix is added.
-- `--all-directory` provides a more thorough filename-blind mode that checks duplicates across the full directory. It only takes effect when used with `-d/--dedupe`.
+- `--directory` provides a more thorough filename-blind mode that checks duplicates across the full directory. It only takes effect when used with `-d/--dedupe`.
+- `--global` extends dedupe scope across the full recursive tree when combined with `-d` and `-r`, and writes provenance JSON sidecars (`<moved-file>.json`) for moved files.
 
-## Variant algorithm flow
+### Dedupe scope matrix
+
+| Flags | Duplicate scope | Grouping method | Moved file destination | Sidecar metadata |
+| --- | --- | --- | --- | --- |
+| `-d` | Per directory | Contiguous same-hash runs in sorted filename order | Same directory `.dups/` | No |
+| `-d --directory` | Per directory | Full-directory hash grouping (filename adjacency ignored) | Same directory `.dups/` | No |
+| `-d --global` | Selected directory only | Full-directory hash grouping (same as `--directory`) | Same directory `.dups/` | No |
+| `-d -r --global` | Full recursive tree | Whole-tree hash grouping across directories | Each file's own source directory `.dups/` | Yes (`.json`) |
+
+### Global mode metadata (`<moved-file>.json`)
+
+In recursive `--global` mode (`-r -d --global`), every moved duplicate gets a sidecar metadata file next to it in `.dups/`:
+
+- Name: `<moved-file>.json`
+- Location: same `.dups/` directory as the moved file
+- Purpose: explain the duplicate set peers and which file was kept vs moved
+
+JSON structure:
+
+```json
+{
+  "hash": "<hash>",
+  "dedupeMode": "shorter",
+  "subject": {
+    "path": "/abs/path/to/dir/.dups/file.ext",
+    "status": "moved"
+  },
+  "others": [
+    {
+      "path": "/abs/path/to/kept/file.ext",
+      "status": "kept"
+    },
+    {
+      "path": "/abs/path/to/another/dir/.dups/file2.ext",
+      "status": "moved"
+    }
+  ]
+}
+```
+
+## Dedupe flow diagrams
+
+### Scope and strategy selection
 
 ```mermaid
 flowchart TD
-  A["Sorted file listing per directory"] --> B{"Dedupe enabled"}
-  B -- No --> C["Hash each file in order<br/>Highlight when current hash equals previous hash"]
-  B -- Yes --> D{"Use --all-directory with -d"}
-  D -- No --> E["Default strategy<br/>Contiguous same-hash runs only<br/>Unreadable files stay visible and do not break hashable run continuity"]
-  D -- Yes --> F["All-directory strategy<br/>Group hashable files by hash across the whole directory"]
-  E --> G["Select keep file by mode: newer, older, shorter, longer<br/>Move others to .dups"]
+  A["Start scan"] --> B{"-d / --dedupe enabled?"}
+  B -- No --> C["Audit mode only<br/>No moves"]
+  B -- Yes --> D{"--global enabled?"}
+  D -- Yes --> E{"-r / --recursive enabled?"}
+  E -- Yes --> F["Global recursive mode<br/>Group hashable files across full tree"]
+  E -- No --> G["Global non-rec mode<br/>Group hashable files in selected directory<br/>(same scope as --directory)"]
+  D -- No --> H{"--directory enabled?"}
+  H -- Yes --> I["Per-directory full hash grouping"]
+  H -- No --> J["Per-directory contiguous-run grouping"]
+  F --> K["Select kept file by mode<br/>(newer/older/shorter/longer)"]
+  G --> K
+  I --> K
+  J --> K
+  K --> L["Move non-kept files to .dups/<br/>in source directories"]
+  L --> M{"Global mode?"}
+  M -- Yes --> N["Write per-moved-file sidecar JSON<br/>(recursive global mode only)"]
+  M -- No --> O["No sidecar JSON"]
+  C --> P["Render output"]
+  N --> P
+  O --> P
+```
+
+### Global sidecar generation lifecycle
+
+```mermaid
+flowchart TD
+  A["Duplicate set identified in --global mode"] --> B["Choose kept file by dedupe mode"]
+  B --> C["Move each non-kept file to source-dir/.dups/"]
+  C --> D["For each moved file:<br/>create <moved-file>.json"]
+  D --> E["subject: moved file path + status moved"]
+  D --> F["others: peer file paths + status kept/moved"]
+  E --> G["Write JSON beside moved file"]
   F --> G
-  C --> H["Render output<br/>Quiet mode shows only duplicate-highlight lines"]
-  G --> H
 ```
 
 ### Strategy summary
 
 - Default (`-d`): optimized for copy/restore/merge artifacts where duplicate names are often alphabetically adjacent.
-- `--all-directory` with `-d`: more thorough and filename-blind dedupe across the entire directory.
-- `--all-directory` without `-d`: no-op (normal non-dedupe listing behavior).
+- `--directory` with `-d`: more thorough and filename-blind dedupe across the entire directory.
+- `--directory` without `-d`: no-op (normal non-dedupe listing behavior).
+- `--global` with `-d -r`: cross-directory, whole-tree hash dedupe with per-moved-file metadata JSON.
+- `--global` with `-d` (no `-r`): equivalent dedupe scope to `--directory` on the selected directory and does not emit sidecar JSON.
 
 ## Examples
 
@@ -335,6 +416,43 @@ flowchart TD
 
 ```bash
 ./lshash.sh --dedupe=longer
+```
+
+### Global dedupe in one directory (non-recursive)
+
+```bash
+./lshash.sh -d shorter --global /path/to/scan
+```
+
+This uses full-directory hash grouping for that single directory (same scope behavior as `--directory`) and does not write sidecar metadata.
+
+### Global dedupe across full recursive tree
+
+```bash
+./lshash.sh -r -d shorter --global /path/to/scan
+```
+
+This compares hashable files across all directories in the tree, moves losers to each file's local `.dups/`, and writes `<moved-file>.json` sidecars.
+
+### Global dedupe with a different keep policy
+
+```bash
+./lshash.sh -r --dedupe newer --global /path/to/scan
+```
+
+In each duplicate set, the newest file is kept in place and all others are moved to their source-directory `.dups/` folders.
+
+### Inspect generated sidecar metadata
+
+```bash
+find /path/to/scan -path '*/.dups/*.json' -maxdepth 6 -print
+cat /path/to/scan/some/dir/.dups/example.txt.json
+```
+
+If `jq` is available:
+
+```bash
+jq . /path/to/scan/some/dir/.dups/example.txt.json
 ```
 
 ### Only show duplicate lines
@@ -489,7 +607,7 @@ sub/pp.txt (moved to .dups/)  <hash-P>
 Summary: scanned 4 file(s); 2 duplicate file(s) were found and moved (50.00% of scanned files); 2 directories were traversed.
 ```
 
-#### 6. `--all-directory` without `-d`: modifier no-op
+#### 6. `--directory` without `-d`: modifier no-op
 
 Hypothetical files in one directory (non-adjacent duplicate content):
 
@@ -502,7 +620,7 @@ z-sync.txt         (content: same)
 Command:
 
 ```bash
-./lshash.sh --algorithm sha256 --all-directory
+./lshash.sh --algorithm sha256 --directory
 ```
 
 Expected output shape:
@@ -514,14 +632,14 @@ z-sync.txt  <hash-S>
 Summary: scanned 3 file(s); 0 duplicate file(s) were found (0.00% of scanned files).
 ```
 
-#### 7. `--all-directory` with `-d`: non-adjacent duplicates moved
+#### 7. `--directory` with `-d`: non-adjacent duplicates moved
 
 Use the same hypothetical files as example 6.
 
 Command:
 
 ```bash
-./lshash.sh --algorithm sha256 -d shorter --all-directory
+./lshash.sh --algorithm sha256 -d shorter --directory
 ```
 
 Expected output shape:
@@ -602,6 +720,7 @@ LSHASH_INSTALL_TIMEOUT=5 ./lshash.sh
 
 - Dedupe only groups contiguous same-hash neighbors (in alphabetical listing order) within the same directory.
 - With `-r`, grouping is still per directory, not across the entire tree.
+- For cross-directory dedupe across the full tree, use `-r -d --global`.
 - Confirm mode selection:
   - `newer` keeps newest
   - `older` keeps oldest
@@ -655,6 +774,14 @@ cd /home/npepin/Projects/lshash
 ./lshash.sh -r --dedupe newer
 ```
 
+### How do I dedupe across the entire recursive tree (not per-directory)?
+
+```bash
+./lshash.sh -r -d shorter --global /path/to/scan
+```
+
+For each moved duplicate in recursive global mode (`-r -d --global`), a sidecar file `<moved-file>.json` is created in `.dups/` with peer paths and `kept`/`moved` status.
+
 ### How do I dedupe but keep the shortest filename instead?
 
 ```bash
@@ -694,7 +821,6 @@ BLAKE3 is a modern cryptographic hash function and a strong default for file has
 For this project, BLAKE3 provides a good balance of speed and safety for differentiating files by content hash.
 
 ### Quick comparison
-
 
 | Algorithm | Speed (typical) | Collision resistance for modern use | Security posture                              | Best fit in this project                                                 |
 | --------- | --------------- | ----------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------ |

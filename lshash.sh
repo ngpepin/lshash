@@ -8,6 +8,7 @@ exclude_patterns=()
 dedupe_enabled="false"
 dedupe_mode="shorter"
 all_directory="false"
+global_dedupe="false"
 prompt_delete="false"
 quiet="false"
 target_dir="."
@@ -26,10 +27,11 @@ if [[ "$platform_name" == "Darwin" ]]; then
 fi
 current_group_files=()
 current_subdirs=()
+global_scope_active="false"
 
 print_help() {
   cat <<'HELP'
-Usage: lshash.sh [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [--all-directory] [--prompt-delete] [-q|--quiet] [DIRECTORY]
+Usage: lshash.sh [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [--directory] [--global] [--prompt-delete] [-q|--quiet] [DIRECTORY]
 
 NAME can be one of:
   blake3, sha256, sha512, sha1, md5, blake2
@@ -44,7 +46,11 @@ Options:
   -d, --dedupe [MODE]        Dedupe files with same hash in each directory
       --dedupe=MODE          Keep one file by MODE, move others to .dups/
                  Valid MODE values: newer, older, shorter, longer
-      --all-directory        With -d, dedupe all files in directory by hash
+      --directory            With -d, dedupe all files in directory by hash
+      --all-directory        Backward-compatible alias for --directory
+      --global               With -d and -r, dedupe globally across all recursive files by hash
+                 (ignores per-directory adjacency grouping).
+             With -d only, behaves like --directory in the selected directory.
       --prompt-delete        With -d, after listing .dups directories, prompt y/N to delete them.
                  Used alone (or with only DIRECTORY), recursively gather existing
                  .dups directories, list them, and prompt y/N to delete them.
@@ -60,7 +66,8 @@ Examples:
   lshash.sh -r -e '*.log' -e '*.tmp'
   lshash.sh --algorithm=sha512 --exclude='build/*' --exclude='*.bak'
   lshash.sh -d
-  lshash.sh -d --all-directory
+  lshash.sh -d --directory
+  lshash.sh -r -d shorter --global
   lshash.sh -r --dedupe newer
   lshash.sh --dedupe=longer
   lshash.sh -dr newer
@@ -230,8 +237,11 @@ parse_args() {
       --quiet)
         quiet="true"
         ;;
-      --all-directory)
+      --directory|--all-directory)
         all_directory="true"
+        ;;
+      --global)
+        global_dedupe="true"
         ;;
       --prompt-delete)
         prompt_delete="true"
@@ -473,6 +483,7 @@ is_prompt_delete_garbage_collect_mode() {
   [[ "$recursive" == "false" ]] || return 1
   [[ "$quiet" == "false" ]] || return 1
   [[ "$all_directory" == "false" ]] || return 1
+  [[ "$global_dedupe" == "false" ]] || return 1
   (( ${#exclude_patterns[@]} == 0 )) || return 1
 
   local normalized_algorithm
@@ -530,6 +541,70 @@ gather_existing_dups_directories() {
       fi
     done
   done
+}
+
+collect_files_for_global_scope() {
+  current_group_files=()
+
+  if [[ "$recursive" != "true" ]]; then
+    collect_files_for_directory "."
+    return
+  fi
+
+  local all_files=()
+  local stack=(".")
+
+  while (( ${#stack[@]} > 0 )); do
+    local dir_rel="${stack[$(( ${#stack[@]} - 1 ))]}"
+    unset 'stack[$(( ${#stack[@]} - 1 ))]'
+    summary_directories=$((summary_directories + 1))
+
+    collect_files_for_directory "$dir_rel"
+    if (( ${#current_group_files[@]} > 0 )); then
+      all_files+=("${current_group_files[@]}")
+    fi
+    collect_subdirs_for_directory "$dir_rel"
+
+    local i
+    for (( i=${#current_subdirs[@]}-1; i>=0; i-- )); do
+      local sub="${current_subdirs[$i]}"
+      if [[ "$dir_rel" == "." ]]; then
+        stack+=("$sub")
+      else
+        stack+=("$dir_rel/$sub")
+      fi
+    done
+  done
+
+  current_group_files=("${all_files[@]}")
+}
+
+to_absolute_path() {
+  local path="$1"
+  if [[ "$path" == /* ]]; then
+    printf '%s' "$path"
+    return
+  fi
+
+  local cwd
+  cwd="$(pwd -P)"
+  if [[ "$path" == "." ]]; then
+    printf '%s' "$cwd"
+  elif [[ "$path" == ./* ]]; then
+    printf '%s/%s' "$cwd" "${path#./}"
+  else
+    printf '%s/%s' "$cwd" "$path"
+  fi
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
 }
 
 is_program_mime_type() {
@@ -733,6 +808,55 @@ format_name_field() {
   fi
 }
 
+format_moved_name_field() {
+  local file_name="$1"
+  local moved_suffix="$2"
+  local display_hash="$3"
+  local fallback_width="$4"
+  local gray=$'\033[37m'
+  local italic=$'\033[3m'
+  local reset=$'\033[0m'
+
+  local field_width="$fallback_width"
+  if (( console_width > 0 )); then
+    local hash_len
+    hash_len="$(visible_text_length "$display_hash")"
+    field_width=$(( console_width - hash_len ))
+  fi
+
+  if (( field_width <= 0 )); then
+    field_width=3
+  fi
+
+  local fitted_name
+  local suffix_len=${#moved_suffix}
+  if (( field_width <= suffix_len )); then
+    fitted_name="$(truncate_right_with_ellipsis "$moved_suffix" "$field_width")"
+  else
+    local file_width=$(( field_width - suffix_len ))
+    local fitted_file
+    fitted_file="$(truncate_right_with_ellipsis "$file_name" "$file_width")"
+    fitted_name="${fitted_file}${moved_suffix}"
+  fi
+
+  local fitted_len=${#fitted_name}
+  local pad_count=$(( field_width - fitted_len ))
+  if (( pad_count < 0 )); then
+    pad_count=0
+  fi
+
+  local pad=""
+  if (( pad_count > 0 )); then
+    pad="$(repeat_middle_dots "$pad_count")"
+  fi
+
+  if (( pad_count > 0 )); then
+    printf '%b%s%b%b%s%b' "$italic" "$fitted_name" "$reset" "$gray" "$pad" "$reset"
+  else
+    printf '%b%s%b' "$italic" "$fitted_name" "$reset"
+  fi
+}
+
 format_percent() {
   local numerator="$1"
   local denominator="$2"
@@ -842,16 +966,103 @@ print_dedupe_group() {
   local run_mtimes=()
   local run_mtime_valid=()
   local run_moved_flags=()
+  local run_moved_paths=()
+
+  resolve_dups_dir_for_file() {
+    local file_path="$1"
+    local fallback_dir_rel="$2"
+
+    if [[ "$global_scope_active" == "true" ]]; then
+      local source_dir="${file_path%/*}"
+      if [[ "$source_dir" == "$file_path" ]]; then
+        printf '.dups'
+      else
+        printf '%s/.dups' "$source_dir"
+      fi
+      return
+    fi
+
+    if [[ "$fallback_dir_rel" == "." ]]; then
+      printf '.dups'
+    else
+      printf '%s/.dups' "$fallback_dir_rel"
+    fi
+  }
+
+  write_global_metadata_for_indices() {
+    local hash="$1"
+    shift
+    local indices=("$@")
+
+    if [[ "$global_scope_active" != "true" ]]; then
+      return 0
+    fi
+
+    if (( ${#indices[@]} < 2 )); then
+      return 0
+    fi
+
+    local subject_idx
+    for subject_idx in "${indices[@]}"; do
+      [[ "${run_moved_flags[$subject_idx]}" == "1" ]] || continue
+      local subject_path="${run_moved_paths[$subject_idx]}"
+      [[ -n "$subject_path" ]] || continue
+
+      local metadata_path="${subject_path}.json"
+      local escaped_hash
+      escaped_hash="$(json_escape "$hash")"
+      local escaped_mode
+      escaped_mode="$(json_escape "$dedupe_mode")"
+      local escaped_subject
+      escaped_subject="$(json_escape "$(to_absolute_path "$subject_path")")"
+
+      {
+        printf '{\n'
+        printf '  "hash": "%s",\n' "$escaped_hash"
+        printf '  "dedupeMode": "%s",\n' "$escaped_mode"
+        printf '  "subject": {\n'
+        printf '    "path": "%s",\n' "$escaped_subject"
+        printf '    "status": "moved"\n'
+        printf '  },\n'
+        printf '  "others": [\n'
+
+        local first="true"
+        local idx
+        for idx in "${indices[@]}"; do
+          if [[ "$idx" == "$subject_idx" ]]; then
+            continue
+          fi
+
+          local other_status="kept"
+          local other_path_rel="${run_files[$idx]}"
+          if [[ "${run_moved_flags[$idx]}" == "1" && -n "${run_moved_paths[$idx]}" ]]; then
+            other_status="moved"
+            other_path_rel="${run_moved_paths[$idx]}"
+          fi
+
+          local other_path_abs
+          other_path_abs="$(to_absolute_path "$other_path_rel")"
+          local escaped_other_path
+          escaped_other_path="$(json_escape "$other_path_abs")"
+
+          if [[ "$first" != "true" ]]; then
+            printf ',\n'
+          fi
+          first="false"
+          printf '    {"path": "%s", "status": "%s"}' "$escaped_other_path" "$other_status"
+        done
+
+        printf '\n'
+        printf '  ]\n'
+        printf '}\n'
+      } > "$metadata_path" || warn_file_issue "write metadata" "$metadata_path" "failed to write metadata json"
+    done
+  }
 
   print_all_entries() {
     local count=${#run_files[@]}
     local j
     for (( j=0; j<count; j++ )); do
-      local display_name="${run_files[$j]}"
-      if [[ "${run_moved_flags[$j]}" == "1" ]]; then
-        display_name+="$moved_suffix"
-      fi
-
       local display_hash
       local is_duplicate="false"
       if [[ "${run_excluded_exec[$j]}" == "1" ]]; then
@@ -870,13 +1081,12 @@ print_dedupe_group() {
       fi
 
       if [[ "$quiet" != "true" || "$is_duplicate" == "true" ]]; then
-        local italicize="false"
-        if [[ "${run_moved_flags[$j]}" == "1" ]]; then
-          italicize="true"
-        fi
-
         local formatted_name
-        formatted_name="$(format_name_field "$display_name" "$display_hash" "$max_name_len" "$italicize")"
+        if [[ "${run_moved_flags[$j]}" == "1" ]]; then
+          formatted_name="$(format_moved_name_field "${run_files[$j]}" "$moved_suffix" "$display_hash" "$max_name_len")"
+        else
+          formatted_name="$(format_name_field "${run_files[$j]}" "$display_hash" "$max_name_len" "false")"
+        fi
         printf "%s%b\n" "$formatted_name" "$display_hash"
       fi
     done
@@ -940,11 +1150,7 @@ print_dedupe_group() {
 
         local source_path="${run_files[$candidate_idx]}"
         local dups_dir
-        if [[ "$dir_rel" == "." ]]; then
-          dups_dir=".dups"
-        else
-          dups_dir="$dir_rel/.dups"
-        fi
+        dups_dir="$(resolve_dups_dir_for_file "$source_path" "$dir_rel")"
 
         mkdir -p -- "$dups_dir"
         local target_path="$dups_dir/${run_basenames[$candidate_idx]}"
@@ -958,10 +1164,13 @@ print_dedupe_group() {
 
         if safe_move_file "$source_path" "$target_path"; then
           run_moved_flags[$candidate_idx]="1"
+          run_moved_paths[$candidate_idx]="$target_path"
           remember_dups_dir "$dups_dir"
             summary_moved_files=$((summary_moved_files + 1))
         fi
       done
+
+      write_global_metadata_for_indices "$run_hash" "${hashable_indices[@]}"
     fi
 
     print_all_entries
@@ -976,6 +1185,7 @@ print_dedupe_group() {
     run_mtimes=()
     run_mtime_valid=()
     run_moved_flags=()
+    run_moved_paths=()
   }
 
   if [[ "$all_directory" == "true" ]]; then
@@ -1005,6 +1215,7 @@ print_dedupe_group() {
       run_mtimes+=("$mtime")
       run_mtime_valid+=("$mtime_valid")
       run_moved_flags+=("0")
+      run_moved_paths+=("")
     done
 
     local entry_count=${#run_files[@]}
@@ -1084,11 +1295,7 @@ print_dedupe_group() {
 
         local source_path="${run_files[$candidate_idx]}"
         local dups_dir
-        if [[ "$dir_rel" == "." ]]; then
-          dups_dir=".dups"
-        else
-          dups_dir="$dir_rel/.dups"
-        fi
+        dups_dir="$(resolve_dups_dir_for_file "$source_path" "$dir_rel")"
 
         mkdir -p -- "$dups_dir"
         local target_path="$dups_dir/${run_basenames[$candidate_idx]}"
@@ -1102,10 +1309,13 @@ print_dedupe_group() {
 
         if safe_move_file "$source_path" "$target_path"; then
           run_moved_flags[$candidate_idx]="1"
+          run_moved_paths[$candidate_idx]="$target_path"
           remember_dups_dir "$dups_dir"
           summary_moved_files=$((summary_moved_files + 1))
         fi
       done
+
+      write_global_metadata_for_indices "$group_hash" "${indices[@]}"
     done
 
     print_all_entries
@@ -1142,6 +1352,7 @@ print_dedupe_group() {
         run_mtimes+=("$mtime")
         run_mtime_valid+=("$mtime_valid")
         run_moved_flags+=("0")
+        run_moved_paths+=("")
       else
         if [[ "$quiet" != "true" ]]; then
           if [[ "$excluded_exec" == "1" ]]; then
@@ -1163,6 +1374,7 @@ print_dedupe_group() {
       run_mtimes+=("$mtime")
       run_mtime_valid+=("$mtime_valid")
       run_moved_flags+=("0")
+      run_moved_paths+=("")
       continue
     fi
 
@@ -1175,6 +1387,7 @@ print_dedupe_group() {
       run_mtimes+=("$mtime")
       run_mtime_valid+=("$mtime_valid")
       run_moved_flags+=("0")
+      run_moved_paths+=("")
       continue
     fi
 
@@ -1190,6 +1403,7 @@ print_dedupe_group() {
     run_mtimes=("$mtime")
     run_mtime_valid=("$mtime_valid")
     run_moved_flags=("0")
+    run_moved_paths=("")
   done
 
   flush_run
@@ -1379,7 +1593,18 @@ if ! command -v "$hash_cmd" >/dev/null 2>&1; then
   fi
 fi
 
-if [[ "$recursive" == "true" ]]; then
+if [[ "$dedupe_enabled" == "true" && "$global_dedupe" == "true" ]]; then
+  all_directory="true"
+  if [[ "$recursive" == "true" ]]; then
+    global_scope_active="true"
+    collect_files_for_global_scope
+    process_directory_files "."
+    global_scope_active="false"
+  else
+    collect_files_for_directory "."
+    process_directory_files "."
+  fi
+elif [[ "$recursive" == "true" ]]; then
   walk_recursive_and_process
 else
   collect_files_for_directory "."

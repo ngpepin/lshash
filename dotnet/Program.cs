@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Blake3;
 using Org.BouncyCastle.Crypto.Digests;
@@ -46,6 +47,8 @@ internal sealed class Options
 
     public bool AllDirectoryDedupe { get; set; }
 
+    public bool GlobalDedupe { get; set; }
+
     public bool PromptDelete { get; set; }
 
     public string RootDirectory { get; set; } = ".";
@@ -70,6 +73,8 @@ internal sealed class FileEntry
     public bool ExcludedExecutableProgram { get; init; }
 
     public bool Moved { get; set; }
+
+    public string? MovedToPath { get; set; }
 }
 
 internal sealed class SummaryStats
@@ -196,7 +201,11 @@ internal static class Program
 
             var summaryStats = new SummaryStats();
 
-            if (options.Recursive)
+            if (options.DedupeEnabled && options.GlobalDedupe)
+            {
+                ProcessGlobalDedupe(options, summaryStats);
+            }
+            else if (options.Recursive)
             {
                 ProcessRecursive(options, summaryStats);
             }
@@ -263,9 +272,15 @@ internal static class Program
                     continue;
                 }
 
-                if (arg == "--all-directory")
+                if (arg is "--directory" or "--all-directory")
                 {
                     options.AllDirectoryDedupe = true;
+                    continue;
+                }
+
+                if (arg == "--global")
+                {
+                    options.GlobalDedupe = true;
                     continue;
                 }
 
@@ -497,7 +512,7 @@ internal static class Program
     {
         Console.WriteLine(
             """
-            Usage: lshash [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [--all-directory] [--prompt-delete] [-q|--quiet] [DIRECTORY]
+            Usage: lshash [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [--directory] [--global] [--prompt-delete] [-q|--quiet] [DIRECTORY]
 
             NAME can be one of:
               blake3, sha256, sha512, sha1, md5, blake2
@@ -512,7 +527,10 @@ internal static class Program
               -d, --dedupe [MODE]        Dedupe files with same hash in each directory
                   --dedupe=MODE          Keep one file by MODE, move others to .dups/
                                           Valid MODE values: newer, older, shorter, longer
-              --all-directory            With -d, dedupe using all files in directory by hash (ignores filename adjacency)
+              --directory                With -d, dedupe using all files in directory by hash (ignores filename adjacency)
+              --all-directory            Backward-compatible alias for --directory
+              --global                   With -d and -r, dedupe globally across the full recursive tree by hash.
+                                         With -d only, behaves like --directory for the selected directory.
               --prompt-delete            With -d, after listing .dups directories, prompt y/N to delete them.
                                           When used alone (or with only DIRECTORY), recursively gather existing .dups directories,
                                           list them, and prompt y/N to delete them.
@@ -529,7 +547,8 @@ internal static class Program
               lshash --algorithm=sha512 --exclude='build/*' --exclude='*.bak'
               lshash -d
               lshash -r --dedupe newer
-              lshash -d --all-directory
+              lshash -d --directory
+              lshash -r -d shorter --global
               lshash --dedupe=longer
                             lshash --prompt-delete
                             lshash --prompt-delete /path/to/scan
@@ -547,7 +566,53 @@ internal static class Program
             && options.ExcludePatterns.Count == 0
             && !options.Quiet
             && !options.AllDirectoryDedupe
+            && !options.GlobalDedupe
             && options.Algorithm == HashAlgorithmKind.Blake3;
+    }
+
+    private static void ProcessGlobalDedupe(Options options, SummaryStats summaryStats)
+    {
+        var files = new List<string>();
+
+        if (options.Recursive)
+        {
+            foreach (var directory in EnumerateDirectoriesDepthFirst())
+            {
+                summaryStats.DirectoriesTraversed++;
+                var directoryFiles = GetFilesForDirectory(directory);
+                if (options.ExcludePatterns.Count > 0)
+                {
+                    directoryFiles = directoryFiles
+                        .Where(path => !options.ExcludePatterns.Any(pattern => GlobMatch(path, pattern)))
+                        .ToList();
+                }
+
+                files.AddRange(directoryFiles);
+            }
+        }
+        else
+        {
+            files = GetFilesForDirectory(".");
+            if (options.ExcludePatterns.Count > 0)
+            {
+                files = files.Where(path => !options.ExcludePatterns.Any(pattern => GlobMatch(path, pattern))).ToList();
+            }
+        }
+
+        summaryStats.TotalFilesScanned += files.Count;
+        if (files.Count == 0)
+        {
+            return;
+        }
+
+        if (!options.Recursive)
+        {
+            var previousHash = string.Empty;
+            PrintWithDedupe(files, options.Algorithm, options.DedupeMode, options.Quiet, allDirectoryDedupe: true, summaryStats, previousHash);
+            return;
+        }
+
+        PrintWithGlobalDedupe(files, options.Algorithm, options.DedupeMode, options.Quiet, writeMetadata: true, summaryStats);
     }
 
     private static void RunPromptDeleteGarbageCollectMode()
@@ -797,8 +862,9 @@ internal static class Program
                 return;
             }
 
-            var displayName = entry.Moved ? entry.RelativePath + movedSuffix : entry.RelativePath;
-            var formattedName = FormatNameField(displayName, displayHash, consoleWidth, maxNameLen, italicize: entry.Moved);
+            var formattedName = entry.Moved
+                ? FormatMovedNameField(entry.RelativePath, movedSuffix, displayHash, consoleWidth, maxNameLen)
+                : FormatNameField(entry.RelativePath, displayHash, consoleWidth, maxNameLen, italicize: false);
             Console.WriteLine($"{formattedName}{displayHash}");
         }
 
@@ -958,6 +1024,159 @@ internal static class Program
         FlushRun();
 
         return previousHash;
+    }
+
+    private static void PrintWithGlobalDedupe(List<string> files, HashAlgorithmKind algorithm, DedupeMode dedupeMode, bool quiet, bool writeMetadata, SummaryStats summaryStats)
+    {
+        const string movedSuffix = " (moved to .dups/)";
+        var maxNameLen = files.Max(path => path.Length + movedSuffix.Length);
+        var consoleWidth = GetConsoleWidth();
+        var previousHash = string.Empty;
+
+        var entries = files.Select(file => BuildEntry(file, algorithm)).ToList();
+        var groups = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        for (var i = 0; i < entries.Count; i++)
+        {
+            var entry = entries[i];
+            if (!entry.HashAvailable || entry.Hash is null)
+            {
+                continue;
+            }
+
+            if (!groups.TryGetValue(entry.Hash, out var indices))
+            {
+                indices = new List<int>();
+                groups[entry.Hash] = indices;
+            }
+
+            indices.Add(i);
+        }
+
+        foreach (var indices in groups.Values)
+        {
+            if (indices.Count < 2)
+            {
+                continue;
+            }
+
+            var keepIndex = indices[0];
+            for (var i = 1; i < indices.Count; i++)
+            {
+                var candidateIndex = indices[i];
+                if (ShouldReplace(entries[candidateIndex], entries[keepIndex], dedupeMode))
+                {
+                    keepIndex = candidateIndex;
+                }
+            }
+
+            foreach (var index in indices)
+            {
+                if (index == keepIndex)
+                {
+                    continue;
+                }
+
+                if (TryMoveToDups(entries[index], summaryStats))
+                {
+                    entries[index].Moved = true;
+                    summaryStats.DuplicateFilesMoved++;
+                }
+            }
+
+            if (writeMetadata)
+            {
+                WriteGlobalDedupeMetadata(entries, indices, dedupeMode);
+            }
+        }
+
+        foreach (var entry in entries)
+        {
+            string displayHash;
+            var isDuplicate = false;
+            if (entry.ExcludedExecutableProgram)
+            {
+                displayHash = "<excluded executable program>";
+            }
+            else if (entry.HashAvailable && entry.Hash is not null)
+            {
+                isDuplicate = previousHash.Length > 0 && entry.Hash == previousHash;
+                if (isDuplicate)
+                {
+                    summaryStats.DuplicateFilesFound++;
+                }
+
+                displayHash = isDuplicate ? $"{Green}{entry.Hash}{Reset}" : entry.Hash;
+                previousHash = entry.Hash;
+            }
+            else
+            {
+                displayHash = "<hash unavailable>";
+            }
+
+            if (quiet && !isDuplicate)
+            {
+                continue;
+            }
+
+            var formattedName = entry.Moved
+                ? FormatMovedNameField(entry.RelativePath, movedSuffix, displayHash, consoleWidth, maxNameLen)
+                : FormatNameField(entry.RelativePath, displayHash, consoleWidth, maxNameLen, italicize: false);
+            Console.WriteLine($"{formattedName}{displayHash}");
+        }
+    }
+
+    private static void WriteGlobalDedupeMetadata(List<FileEntry> entries, List<int> groupIndices, DedupeMode dedupeMode)
+    {
+        var canonicalEntries = groupIndices.Select(index => entries[index]).ToList();
+        foreach (var subject in canonicalEntries)
+        {
+            if (!subject.Moved || string.IsNullOrWhiteSpace(subject.MovedToPath))
+            {
+                continue;
+            }
+
+            var others = canonicalEntries
+                .Where(entry => !ReferenceEquals(entry, subject))
+                .Select(entry => new
+                {
+                    path = GetFinalPath(entry),
+                    status = entry.Moved ? "moved" : "kept",
+                })
+                .ToList();
+
+            var payload = new
+            {
+                hash = subject.Hash,
+                dedupeMode = dedupeMode.ToString().ToLowerInvariant(),
+                subject = new
+                {
+                    path = subject.MovedToPath,
+                    status = "moved",
+                },
+                others,
+            };
+
+            var metadataPath = subject.MovedToPath + ".json";
+            try
+            {
+                var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(metadataPath, json + Environment.NewLine);
+            }
+            catch (Exception ex)
+            {
+                Warn("write metadata", metadataPath, ex.Message);
+            }
+        }
+    }
+
+    private static string GetFinalPath(FileEntry entry)
+    {
+        if (entry.Moved && !string.IsNullOrWhiteSpace(entry.MovedToPath))
+        {
+            return entry.MovedToPath;
+        }
+
+        return GetAbsolutePath(entry.RelativePath);
     }
 
     private static void PrintSummary(Options options, SummaryStats summaryStats)
@@ -1236,6 +1455,7 @@ internal static class Program
             }
 
             File.Move(sourcePath, targetPath);
+            entry.MovedToPath = targetPath;
             summaryStats.DupsDirectories.Add(dupsDirAbs);
             return true;
         }
@@ -1524,6 +1744,36 @@ internal static class Program
         }
 
         var fitted = TruncateRightWithEllipsis(fileName, fieldWidth);
+        return FormatFittedNameField(fitted, fieldWidth, italicize);
+    }
+
+    private static string FormatMovedNameField(string fileName, string movedSuffix, string displayHash, int consoleWidth, int fallbackNameWidth)
+    {
+        var fieldWidth = consoleWidth > 0
+            ? consoleWidth - VisibleLength(displayHash)
+            : fallbackNameWidth;
+
+        if (fieldWidth <= 0)
+        {
+            fieldWidth = 3;
+        }
+
+        string fitted;
+        if (fieldWidth <= movedSuffix.Length)
+        {
+            fitted = TruncateRightWithEllipsis(movedSuffix, fieldWidth);
+        }
+        else
+        {
+            var fileWidth = fieldWidth - movedSuffix.Length;
+            fitted = TruncateRightWithEllipsis(fileName, fileWidth) + movedSuffix;
+        }
+
+        return FormatFittedNameField(fitted, fieldWidth, italicize: true);
+    }
+
+    private static string FormatFittedNameField(string fitted, int fieldWidth, bool italicize)
+    {
         var sb = new StringBuilder();
 
         if (italicize)
