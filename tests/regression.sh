@@ -238,6 +238,13 @@ setup_global_recursive_cross_directory() {
   printf 'unique\n' > "$root/sub/unique.txt"
 }
 
+setup_global_recursive_same_basename_different_paths() {
+  local root="$1"
+  mkdir -p "$root/x" "$root/very/deep/nested/path"
+  printf 'same\n' > "$root/x/dup.bin"
+  cp "$root/x/dup.bin" "$root/very/deep/nested/path/dup.bin"
+}
+
 setup_move_dups_default_root() {
   local root="$1"
   mkdir -p "$root/.dups" "$root/sub/.dups"
@@ -374,6 +381,18 @@ main() {
   assert_contains "$case_dir/bashcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" "\"status\": \"moved\"" "metadata json should identify moved file"
   assert_contains "$case_dir/dotnetcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" "\"status\": \"kept\"" "dotnet metadata json should identify kept file"
   assert_contains "$case_dir/dotnetcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" "\"status\": \"moved\"" "dotnet metadata json should identify moved file"
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "global recursive shorter uses full path" setup_global_recursive_same_basename_different_paths --algorithm=sha256 -r -d shorter --global)"
+  assert_contains "$case_dir/bash.clean" "very/deep/nested/path/dup.bin (moved to .dups/)" "shorter mode should keep shorter full path in global recursive dedupe"
+  [[ -f "$case_dir/bashcase/very/deep/nested/path/.dups/dup.bin" ]] || { echo "Assertion failed: bash shorter global should move longer full-path duplicate" >&2; exit 1; }
+  [[ -f "$case_dir/dotnetcase/very/deep/nested/path/.dups/dup.bin" ]] || { echo "Assertion failed: dotnet shorter global should move longer full-path duplicate" >&2; exit 1; }
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "global recursive longer uses full path" setup_global_recursive_same_basename_different_paths --algorithm=sha256 -r -d longer --global)"
+  assert_contains "$case_dir/bash.clean" "x/dup.bin (moved to .dups/)" "longer mode should keep longer full path in global recursive dedupe"
+  [[ -f "$case_dir/bashcase/x/.dups/dup.bin" ]] || { echo "Assertion failed: bash longer global should move shorter full-path duplicate" >&2; exit 1; }
+  [[ -f "$case_dir/dotnetcase/x/.dups/dup.bin" ]] || { echo "Assertion failed: dotnet longer global should move shorter full-path duplicate" >&2; exit 1; }
   rm -rf "$case_dir"
 
   case_dir="$(run_pair "move-dups spaced syntax default root" setup_move_dups_default_root --move-dups .dups-archive)"

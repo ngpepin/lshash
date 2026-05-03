@@ -1237,12 +1237,12 @@ print_dedupe_group() {
             fi
             ;;
           shorter)
-            if (( ${#run_basenames[$candidate_idx]} < ${#run_basenames[$keep_idx]} )); then
+            if (( ${#run_files[$candidate_idx]} < ${#run_files[$keep_idx]} )); then
               choose_candidate="true"
             fi
             ;;
           longer)
-            if (( ${#run_basenames[$candidate_idx]} > ${#run_basenames[$keep_idx]} )); then
+            if (( ${#run_files[$candidate_idx]} > ${#run_files[$keep_idx]} )); then
               choose_candidate="true"
             fi
             ;;
@@ -1407,12 +1407,12 @@ print_dedupe_group() {
             fi
             ;;
           shorter)
-            if (( ${#run_basenames[$candidate_idx]} < ${#run_basenames[$keep_idx]} )); then
+            if (( ${#run_files[$candidate_idx]} < ${#run_files[$keep_idx]} )); then
               choose_candidate="true"
             fi
             ;;
           longer)
-            if (( ${#run_basenames[$candidate_idx]} > ${#run_basenames[$keep_idx]} )); then
+            if (( ${#run_files[$candidate_idx]} > ${#run_files[$keep_idx]} )); then
               choose_candidate="true"
             fi
             ;;

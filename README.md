@@ -4,6 +4,12 @@ A corpus-hygiene utility for RAG data pipelines that identifies duplicate conten
 
 Topic tags: rag, retrieval-augmented-generation, data-curation, data-governance, corpus-hygiene, document-deduplication, file-deduplication, knowledge-management, data-quality, bash, dotnet
 
+## Documentation map
+
+- `README.md`: quick-start reference and command/flag summary
+- `USERGUIDE.md`: step-by-step tutorial with practical workflows
+- `ARCHITECTURE.md`: internal design and implementation architecture (Bash + .NET)
+
 ## Features
 
 - Sorts files alphabetically.
@@ -147,7 +153,7 @@ dotnet run -c Release -- --help
 
 ### .NET options
 
-The .NET implementation supports the same options as Bash (`--algorithm`, `-r/--recursive`, `-e/--exclude`, `-d/--dedupe`, `--directory` (alias `--all-directory`), `--global`, `--prompt-delete`, `-q/--quiet`, optional `DIRECTORY`):
+The .NET implementation supports the same options as Bash (`--algorithm`, `-r/--recursive`, `-e/--exclude`, `-d/--dedupe`, `--directory` (alias `--all-directory`), `--global`, `--prompt-delete`, `--move-dups`, `-q/--quiet`, optional `DIRECTORY`):
 
 - `--directory` (alias: `--all-directory`)
   - With `-d/--dedupe`, dedupe by hash across all files in each directory, ignoring filename adjacency
@@ -161,17 +167,26 @@ The .NET implementation supports the same options as Bash (`--algorithm`, `-r/--
   - With `-d/--dedupe`, after listing `.dups` directories, prompts `y/N` to delete them
   - Used alone (or with only `DIRECTORY`), recursively gathers existing `.dups` directories, lists them, and prompts `y/N` to delete them
   - When combined with other non-dedupe options, this flag is a no-op
+- `--move-dups PATH` / `--move-dups=PATH`
+  - Standalone mode (optionally scoped by `DIRECTORY`) that recursively finds existing `.dups` directories and moves them under `PATH`, preserving the source tree structure
 
 ### .NET BLAKE3 backend selection
 
-- Default backend is GPU via `vendor/libblake3gpu.so`.
+- Default backend is CPU.
 - Override backend with environment variable `LSHASH_BLAKE3_BACKEND`:
-  - `gpu` (default)
-  - `cpu`
+  - `cpu` (default)
+  - `gpu`
 - If GPU backend initialization or hashing fails at runtime, the process falls back to CPU BLAKE3 for the remainder of that run.
 - Optional GPU chunk budget override:
   - `LSHASH_BLAKE3_GPU_MAX_CHUNKS` (positive integer)
   - Default: `1048576` (`1 << 20`)
+
+### .NET performance tuning environment variables
+
+- `LSHASH_DIAGNOSTICS=1` enables tuning diagnostics output.
+- Network filesystems (for example `cifs`, `smb3`, `nfs`) auto-enable diagnostics even without `LSHASH_DIAGNOSTICS`.
+- `LSHASH_HASH_WORKERS=<N>` pins a fixed worker count (disables adaptive worker tuning).
+- `LSHASH_READ_BUFFER_KB=<N>` sets read buffer size for sequential hashing.
 
 ### .NET examples
 
@@ -186,12 +201,14 @@ dotnet/dist/linux-x64/lshash -r -d shorter --global
 dotnet/dist/linux-x64/lshash -d shorter --prompt-delete
 dotnet/dist/linux-x64/lshash --prompt-delete
 dotnet/dist/linux-x64/lshash --prompt-delete /path/to/scan
+dotnet/dist/linux-x64/lshash --move-dups /path/to/archive
+dotnet/dist/linux-x64/lshash --move-dups=/path/to/archive /path/to/scan
 ```
 
 ## Usage
 
 ```bash
-./lshash.sh [--algorithm NAME] [-r|--recursive] [-e PATTERN] [--exclude PATTERN] [-d [MODE]] [--directory] [--global] [--prompt-delete] [-q|--quiet] [DIRECTORY]
+./lshash.sh [--algorithm NAME] [-r|--recursive] [-e PATTERN] [--exclude PATTERN] [-d [MODE]] [--directory] [--global] [--prompt-delete] [--move-dups PATH] [-q|--quiet] [DIRECTORY]
 ```
 
 ## macOS execution quick guide
@@ -239,6 +256,7 @@ cd dotnet/deploy/macos
   - Dedupe files with identical hash in the same directory
   - Valid `MODE` values: `newer`, `older`, `shorter`, `longer`
   - Default mode when omitted: `shorter`
+  - `shorter` / `longer` compare full root-relative path length (directory path + basename), not basename-only length
 - `--directory` (alias: `--all-directory`)
   - With `-d/--dedupe`, uses full-directory hash grouping instead of contiguous-neighbor grouping
   - Without `-d/--dedupe`, no-op
@@ -251,6 +269,8 @@ cd dotnet/deploy/macos
   - With `-d/--dedupe`, after printing `.dups` directory paths, prompts `y/N` to delete them
   - Used alone (or with only `DIRECTORY`), recursively gathers existing `.dups` directories, lists them, and prompts `y/N` to delete them
   - When combined with other non-dedupe options, no-op
+- `--move-dups PATH` / `--move-dups=PATH`
+  - Standalone mode (optionally scoped by `DIRECTORY`) that recursively finds existing `.dups` directories and moves them under `PATH`, preserving root-relative structure
 - `-q`, `--quiet`
   - Only print duplicate lines (the lines that would be highlighted green in normal output)
   - Works with and without dedupe, and with and without recursive mode
@@ -327,44 +347,7 @@ JSON structure:
 
 ## Dedupe flow diagrams
 
-### Scope and strategy selection
-
-```mermaid
-flowchart TD
-  A["Start scan"] --> B{"-d / --dedupe enabled?"}
-  B -- No --> C["Audit mode only<br/>No moves"]
-  B -- Yes --> D{"--global enabled?"}
-  D -- Yes --> E{"-r / --recursive enabled?"}
-  E -- Yes --> F["Global recursive mode<br/>Group hashable files across full tree"]
-  E -- No --> G["Global non-rec mode<br/>Group hashable files in selected directory<br/>(same scope as --directory)"]
-  D -- No --> H{"--directory enabled?"}
-  H -- Yes --> I["Per-directory full hash grouping"]
-  H -- No --> J["Per-directory contiguous-run grouping"]
-  F --> K["Select kept file by mode<br/>(newer/older/shorter/longer)"]
-  G --> K
-  I --> K
-  J --> K
-  K --> L["Move non-kept files to .dups/<br/>in source directories"]
-  L --> M{"Global mode?"}
-  M -- Yes --> N["Write per-moved-file sidecar JSON<br/>(recursive global mode only)"]
-  M -- No --> O["No sidecar JSON"]
-  C --> P["Render output"]
-  N --> P
-  O --> P
-```
-
-### Global sidecar generation lifecycle
-
-```mermaid
-flowchart TD
-  A["Duplicate set identified in --global mode"] --> B["Choose kept file by dedupe mode"]
-  B --> C["Move each non-kept file to source-dir/.dups/"]
-  C --> D["For each moved file:<br/>create <moved-file>.json"]
-  D --> E["subject: moved file path + status moved"]
-  D --> F["others: peer file paths + status kept/moved"]
-  E --> G["Write JSON beside moved file"]
-  F --> G
-```
+Technical flow diagrams are maintained in `ARCHITECTURE.md`.
 
 ### Strategy summary
 
@@ -412,7 +395,7 @@ flowchart TD
 ./lshash.sh -r --dedupe newer
 ```
 
-### Dedupe and keep longest file name
+### Dedupe and keep longest full relative path
 
 ```bash
 ./lshash.sh --dedupe=longer
@@ -467,6 +450,13 @@ jq . /path/to/scan/some/dir/.dups/example.txt.json
 ```bash
 ./lshash.sh --prompt-delete
 ./lshash.sh --prompt-delete /path/to/scan
+```
+
+### Move existing `.dups` directories into an archive tree
+
+```bash
+./lshash.sh --move-dups /path/to/archive
+./lshash.sh --move-dups=/path/to/archive /path/to/scan
 ```
 
 ### Summary message examples (hypothetical)
@@ -724,8 +714,8 @@ LSHASH_INSTALL_TIMEOUT=5 ./lshash.sh
 - Confirm mode selection:
   - `newer` keeps newest
   - `older` keeps oldest
-  - `shorter` keeps shortest file name (default)
-  - `longer` keeps longest file name
+  - `shorter` keeps shortest full root-relative path (default)
+  - `longer` keeps longest full root-relative path
 
 ### Quiet mode printed nothing
 
@@ -782,10 +772,19 @@ cd /home/npepin/Projects/lshash
 
 For each moved duplicate in recursive global mode (`-r -d --global`), a sidecar file `<moved-file>.json` is created in `.dups/` with peer paths and `kept`/`moved` status.
 
-### How do I dedupe but keep the shortest filename instead?
+### How do I dedupe but keep the shortest full relative path instead?
 
 ```bash
 ./lshash.sh -d
+```
+
+This uses `shorter`, which compares full root-relative path length.
+
+### How do I archive existing `.dups` directories without re-running dedupe?
+
+```bash
+./lshash.sh --move-dups /path/to/archive
+./lshash.sh --move-dups=/path/to/archive /path/to/scan
 ```
 
 ### Where do moved duplicates go?
@@ -808,22 +807,4 @@ chmod +x tests/regression.sh
 ./tests/regression.sh
 ```
 
-## Appendix A: Advantages of BLAKE3
-
-BLAKE3 is a modern cryptographic hash function and a strong default for file hashing workflows.
-
-- High speed: significantly faster than older hashes (such as SHA-256) on many systems, which helps when scanning large directories.
-- Efficient scaling: designed to use parallelism well, so it performs especially well on modern multi-core CPUs.
-- Strong security design: built from well-reviewed cryptographic components and intended for robust integrity checking.
-- Flexible output: supports extendable output mode (XOF), which allows generating more output bytes when needed for advanced uses.
-- Practical tooling: available via `b3sum`, making it easy to integrate into scripts and command-line workflows.
-
-For this project, BLAKE3 provides a good balance of speed and safety for differentiating files by content hash.
-
-### Quick comparison
-
-| Algorithm | Speed (typical) | Collision resistance for modern use | Security posture                              | Best fit in this project                                                 |
-| --------- | --------------- | ----------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------ |
-| BLAKE3    | Very high       | Strong                              | Modern cryptographic design                   | Default choice for fast, reliable file differentiation                   |
-| SHA-256   | Moderate        | Strong                              | Widely standardized and trusted               | Great compatibility fallback when BLAKE3 is unavailable                  |
-| MD5       | Very high       | Weak                                | Not suitable for adversarial integrity checks | Non-security workflows where speed matters and collisions are acceptable |
+For hash-algorithm rationale and comparison notes, see the BLAKE3 appendix in `ARCHITECTURE.md`.

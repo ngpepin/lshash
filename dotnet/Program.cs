@@ -1646,8 +1646,8 @@ internal static class Program
         {
             DedupeMode.Newer => candidate.MtimeAvailable && (!current.MtimeAvailable || candidate.MtimeSeconds > current.MtimeSeconds),
             DedupeMode.Older => candidate.MtimeAvailable && (!current.MtimeAvailable || candidate.MtimeSeconds < current.MtimeSeconds),
-            DedupeMode.Shorter => candidate.BaseName.Length < current.BaseName.Length,
-            DedupeMode.Longer => candidate.BaseName.Length > current.BaseName.Length,
+            DedupeMode.Shorter => candidate.RelativePath.Length < current.RelativePath.Length,
+            DedupeMode.Longer => candidate.RelativePath.Length > current.RelativePath.Length,
             _ => false,
         };
     }
