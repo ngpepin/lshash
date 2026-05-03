@@ -43,6 +43,40 @@ assert_same_output() {
   fi
 }
 
+assert_occurrences() {
+  local file="$1"
+  local text="$2"
+  local expected_count="$3"
+  local message="$4"
+  local actual_count
+
+  actual_count="$(grep -F -- "$text" "$file" | wc -l | tr -d ' ')"
+  if [[ "$actual_count" != "$expected_count" ]]; then
+    echo "Assertion failed: $message" >&2
+    echo "Expected occurrence count: $expected_count" >&2
+    echo "Actual occurrence count: $actual_count" >&2
+    exit 1
+  fi
+}
+
+assert_order() {
+  local file="$1"
+  local first_text="$2"
+  local second_text="$3"
+  local message="$4"
+  local first_line
+  local second_line
+
+  first_line="$(grep -nF -- "$first_text" "$file" | head -n1 | cut -d: -f1 || true)"
+  second_line="$(grep -nF -- "$second_text" "$file" | head -n1 | cut -d: -f1 || true)"
+
+  if [[ -z "$first_line" || -z "$second_line" || "$second_line" -le "$first_line" ]]; then
+    echo "Assertion failed: $message" >&2
+    echo "Expected '$second_text' to appear after '$first_text'" >&2
+    exit 1
+  fi
+}
+
 ensure_dotnet_binary() {
   (cd "$ROOT_DIR/dotnet" && ./build.sh linux-x64 >/dev/null)
 }
@@ -204,6 +238,21 @@ setup_global_recursive_cross_directory() {
   printf 'unique\n' > "$root/sub/unique.txt"
 }
 
+setup_move_dups_default_root() {
+  local root="$1"
+  mkdir -p "$root/.dups" "$root/sub/.dups"
+  printf 'root-dup\n' > "$root/.dups/a.txt"
+  printf 'sub-dup\n' > "$root/sub/.dups/b.txt"
+}
+
+setup_move_dups_scoped_root() {
+  local root="$1"
+  mkdir -p "$root/scan/a/.dups" "$root/scan/b/c/.dups" "$root/outside/.dups"
+  printf 'x\n' > "$root/scan/a/.dups/one.txt"
+  printf 'y\n' > "$root/scan/b/c/.dups/two.txt"
+  printf 'z\n' > "$root/outside/.dups/keep.txt"
+}
+
 main() {
   ensure_dotnet_binary
 
@@ -284,6 +333,9 @@ main() {
 
   case_dir="$(run_pair "directory dedupe non-adjacent" setup_all_directory_non_adjacent --algorithm=sha256 -d shorter --directory)"
   assert_contains "$case_dir/bash.clean" "z-sync-conflict.txt (moved to .dups/)" "--directory with -d should dedupe non-adjacent duplicates"
+  assert_occurrences "$case_dir/bash.clean" "z-sync-conflict.txt" "2" "--directory should list duplicate during hashing and re-list it after move"
+  assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/.dups" "--directory should list .dups directories"
+  assert_order "$case_dir/bash.clean" "Summary: scanned" "<CASE_ROOT>/.dups" ".dups directories should be listed after summary for --directory"
   [[ -f "$case_dir/bashcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: bash --directory with -d should move duplicate" >&2; exit 1; }
   [[ -f "$case_dir/dotnetcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: dotnet --directory with -d should move duplicate" >&2; exit 1; }
   rm -rf "$case_dir"
@@ -300,6 +352,9 @@ main() {
 
   case_dir="$(run_pair "global non-rec behaves all-directory" setup_all_directory_non_adjacent --algorithm=sha256 -d shorter --global)"
   assert_contains "$case_dir/bash.clean" "z-sync-conflict.txt (moved to .dups/)" "--global with -d should dedupe non-adjacent duplicates in non-recursive mode"
+  assert_occurrences "$case_dir/bash.clean" "z-sync-conflict.txt" "2" "--global non-recursive should list duplicate during hashing and re-list it after move"
+  assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/.dups" "--global non-recursive should list .dups directories"
+  assert_order "$case_dir/bash.clean" "Summary: scanned" "<CASE_ROOT>/.dups" ".dups directories should be listed after summary for non-recursive --global"
   [[ -f "$case_dir/bashcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: bash --global non-recursive should move duplicate" >&2; exit 1; }
   [[ -f "$case_dir/dotnetcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: dotnet --global non-recursive should move duplicate" >&2; exit 1; }
   [[ ! -f "$case_dir/bashcase/.dups/z-sync-conflict.txt.json" ]] || { echo "Assertion failed: bash --global non-recursive should not write metadata json" >&2; exit 1; }
@@ -308,6 +363,9 @@ main() {
 
   case_dir="$(run_pair "global recursive cross-directory" setup_global_recursive_cross_directory --algorithm=sha256 -r -d shorter --global)"
   assert_contains "$case_dir/bash.clean" "sub/this_is_a_significantly_longer_duplicate_filename.txt (moved to .dups/)" "--global recursive should dedupe across directories and move loser in-place"
+  assert_occurrences "$case_dir/bash.clean" "sub/this_is_a_significantly_longer_duplicate_filename.txt" "2" "--global recursive should list duplicate during hashing and re-list it after move"
+  assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/sub/.dups" "--global recursive should list all .dups directories"
+  assert_order "$case_dir/bash.clean" "Summary: scanned" "<CASE_ROOT>/sub/.dups" ".dups directories should be listed after summary for recursive --global"
   [[ -f "$case_dir/bashcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt" ]] || { echo "Assertion failed: bash --global recursive should move duplicate into source directory .dups" >&2; exit 1; }
   [[ -f "$case_dir/dotnetcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt" ]] || { echo "Assertion failed: dotnet --global recursive should move duplicate into source directory .dups" >&2; exit 1; }
   [[ -f "$case_dir/bashcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" ]] || { echo "Assertion failed: bash --global recursive should write metadata json" >&2; exit 1; }
@@ -316,6 +374,28 @@ main() {
   assert_contains "$case_dir/bashcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" "\"status\": \"moved\"" "metadata json should identify moved file"
   assert_contains "$case_dir/dotnetcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" "\"status\": \"kept\"" "dotnet metadata json should identify kept file"
   assert_contains "$case_dir/dotnetcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt.json" "\"status\": \"moved\"" "dotnet metadata json should identify moved file"
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "move-dups spaced syntax default root" setup_move_dups_default_root --move-dups .dups-archive)"
+  assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/.dups-archive/.dups" "--move-dups should print moved root .dups destination"
+  assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/.dups-archive/sub/.dups" "--move-dups should preserve tree structure for nested .dups"
+  [[ ! -d "$case_dir/bashcase/.dups" ]] || { echo "Assertion failed: bash --move-dups should remove source root .dups" >&2; exit 1; }
+  [[ ! -d "$case_dir/dotnetcase/.dups" ]] || { echo "Assertion failed: dotnet --move-dups should remove source root .dups" >&2; exit 1; }
+  [[ -d "$case_dir/bashcase/.dups-archive/.dups" ]] || { echo "Assertion failed: bash --move-dups should create archive root .dups" >&2; exit 1; }
+  [[ -d "$case_dir/dotnetcase/.dups-archive/.dups" ]] || { echo "Assertion failed: dotnet --move-dups should create archive root .dups" >&2; exit 1; }
+  [[ -d "$case_dir/bashcase/.dups-archive/sub/.dups" ]] || { echo "Assertion failed: bash --move-dups should create archive nested .dups" >&2; exit 1; }
+  [[ -d "$case_dir/dotnetcase/.dups-archive/sub/.dups" ]] || { echo "Assertion failed: dotnet --move-dups should create archive nested .dups" >&2; exit 1; }
+  rm -rf "$case_dir"
+
+  case_dir="$(run_pair "move-dups equals syntax with scoped root" setup_move_dups_scoped_root --move-dups=.dups-archive scan)"
+  assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/scan/.dups-archive/a/.dups" "--move-dups=PATH should move scoped root .dups directories"
+  assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/scan/.dups-archive/b/c/.dups" "--move-dups=PATH should preserve scoped nested tree"
+  [[ ! -d "$case_dir/bashcase/scan/a/.dups" ]] || { echo "Assertion failed: bash --move-dups=PATH should remove scoped source .dups" >&2; exit 1; }
+  [[ ! -d "$case_dir/dotnetcase/scan/a/.dups" ]] || { echo "Assertion failed: dotnet --move-dups=PATH should remove scoped source .dups" >&2; exit 1; }
+  [[ -d "$case_dir/bashcase/scan/.dups-archive/a/.dups" ]] || { echo "Assertion failed: bash --move-dups=PATH should create scoped archive .dups" >&2; exit 1; }
+  [[ -d "$case_dir/dotnetcase/scan/.dups-archive/a/.dups" ]] || { echo "Assertion failed: dotnet --move-dups=PATH should create scoped archive .dups" >&2; exit 1; }
+  [[ -d "$case_dir/bashcase/outside/.dups" ]] || { echo "Assertion failed: bash scoped --move-dups should not move outside root .dups" >&2; exit 1; }
+  [[ -d "$case_dir/dotnetcase/outside/.dups" ]] || { echo "Assertion failed: dotnet scoped --move-dups should not move outside root .dups" >&2; exit 1; }
   rm -rf "$case_dir"
 
   tmpdir="$(mktemp -d)"

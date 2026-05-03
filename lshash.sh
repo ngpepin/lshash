@@ -10,6 +10,8 @@ dedupe_mode="shorter"
 all_directory="false"
 global_dedupe="false"
 prompt_delete="false"
+move_dups_enabled="false"
+move_dups_destination=""
 quiet="false"
 target_dir="."
 target_dir_set="false"
@@ -31,7 +33,7 @@ global_scope_active="false"
 
 print_help() {
   cat <<'HELP'
-Usage: lshash.sh [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [--directory] [--global] [--prompt-delete] [-q|--quiet] [DIRECTORY]
+Usage: lshash.sh [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [--directory] [--global] [--prompt-delete] [--move-dups PATH] [-q|--quiet] [DIRECTORY]
 
 NAME can be one of:
   blake3, sha256, sha512, sha1, md5, blake2
@@ -54,6 +56,10 @@ Options:
       --prompt-delete        With -d, after listing .dups directories, prompt y/N to delete them.
                  Used alone (or with only DIRECTORY), recursively gather existing
                  .dups directories, list them, and prompt y/N to delete them.
+      --move-dups PATH       Standalone mode: recursively gather existing .dups directories
+             under DIRECTORY root (or current directory), then move each .dups
+             directory into PATH while preserving root-relative tree structure.
+      --move-dups=PATH       Same as --move-dups PATH
   -q, --quiet                Only print duplicate (green) file lines
 
 Short-option stacking:
@@ -73,6 +79,8 @@ Examples:
   lshash.sh -dr newer
   lshash.sh --prompt-delete
   lshash.sh --prompt-delete /path/to/scan
+  lshash.sh --move-dups /path/to/archive
+  lshash.sh --move-dups=/path/to/archive /path/to/scan
   lshash.sh -rq /path/to/scan
 HELP
 }
@@ -245,6 +253,31 @@ parse_args() {
         ;;
       --prompt-delete)
         prompt_delete="true"
+        ;;
+      --move-dups=*)
+        if [[ "$move_dups_enabled" == "true" ]]; then
+          echo "--move-dups may only be provided once" >&2
+          exit 1
+        fi
+        move_dups_enabled="true"
+        move_dups_destination="${arg#--move-dups=}"
+        if [[ -z "$move_dups_destination" ]]; then
+          echo "Missing value for --move-dups" >&2
+          exit 1
+        fi
+        ;;
+      --move-dups)
+        if [[ "$move_dups_enabled" == "true" ]]; then
+          echo "--move-dups may only be provided once" >&2
+          exit 1
+        fi
+        if (( arg_index + 1 >= arg_count )); then
+          echo "Missing value for --move-dups" >&2
+          exit 1
+        fi
+        arg_index=$((arg_index + 1))
+        move_dups_enabled="true"
+        move_dups_destination="${args[$arg_index]}"
         ;;
       -h|--help)
         print_help
@@ -489,6 +522,83 @@ is_prompt_delete_garbage_collect_mode() {
   local normalized_algorithm
   normalized_algorithm="$(printf '%s' "$algorithm" | tr '[:upper:]' '[:lower:]')"
   [[ "$normalized_algorithm" == "blake3" ]]
+}
+
+is_move_dups_mode() {
+  [[ "$move_dups_enabled" == "true" ]] || return 1
+  [[ "$dedupe_enabled" == "false" ]] || return 1
+  [[ "$prompt_delete" == "false" ]] || return 1
+  [[ "$recursive" == "false" ]] || return 1
+  [[ "$quiet" == "false" ]] || return 1
+  [[ "$all_directory" == "false" ]] || return 1
+  [[ "$global_dedupe" == "false" ]] || return 1
+  (( ${#exclude_patterns[@]} == 0 )) || return 1
+
+  local normalized_algorithm
+  normalized_algorithm="$(printf '%s' "$algorithm" | tr '[:upper:]' '[:lower:]')"
+  [[ "$normalized_algorithm" == "blake3" ]] || return 1
+  [[ -n "$move_dups_destination" ]]
+}
+
+move_existing_dups_directories() {
+  local destination_path="$1"
+  local green=$'\033[32m'
+  local reset=$'\033[0m'
+
+  if (( ${#dups_dirs[@]} == 0 )); then
+    printf '%b%s%b\n' "$green" "No .dups directories were found." "$reset"
+    return 0
+  fi
+
+  if ! mkdir -p -- "$destination_path" 2>/dev/null; then
+    warn_file_issue "create" "$destination_path" "failed to create destination directory"
+    return 1
+  fi
+
+  local destination_abs
+  if ! destination_abs="$(cd -- "$destination_path" 2>/dev/null && pwd -P)"; then
+    warn_file_issue "resolve" "$destination_path" "failed to resolve destination directory"
+    return 1
+  fi
+
+  local root_abs
+  root_abs="$(pwd -P)"
+
+  local source_abs
+  while IFS= read -r source_abs; do
+    [[ -z "$source_abs" ]] && continue
+
+    local rel_path
+    if [[ "$source_abs" == "$root_abs/.dups" ]]; then
+      rel_path=".dups"
+    elif [[ "$source_abs" == "$root_abs/"* ]]; then
+      rel_path="${source_abs#$root_abs/}"
+    else
+      warn_file_issue "move" "$source_abs" "path is outside root directory"
+      continue
+    fi
+
+    local target_abs="$destination_abs/$rel_path"
+    if [[ "$source_abs" == "$target_abs" ]]; then
+      warn_file_issue "move" "$source_abs" "source and destination are the same"
+      continue
+    fi
+
+    local target_parent="${target_abs%/*}"
+    if ! mkdir -p -- "$target_parent" 2>/dev/null; then
+      warn_file_issue "create" "$target_parent" "failed to create target parent directory"
+      continue
+    fi
+
+    if [[ -e "$target_abs" ]]; then
+      warn_file_issue "move" "$source_abs" "destination already exists: $target_abs"
+      continue
+    fi
+
+    if safe_move_file "$source_abs" "$target_abs"; then
+      printf '%b%s%b\n' "$green" "$target_abs" "$reset"
+    fi
+  done < <(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)
 }
 
 gather_existing_dups_directories() {
@@ -1219,8 +1329,33 @@ print_dedupe_group() {
     done
 
     local entry_count=${#run_files[@]}
-    local processed_flags=()
+
     local i
+    for (( i=0; i<entry_count; i++ )); do
+      local display_hash
+      local is_duplicate="false"
+      if [[ "${run_excluded_exec[$i]}" == "1" ]]; then
+        display_hash="<excluded executable program>"
+      elif [[ "${run_hash_valid[$i]}" == "1" ]]; then
+        local hash="${run_hashes[$i]}"
+        display_hash="$hash"
+        if [[ -n "$prev_hash" && "$hash" == "$prev_hash" ]]; then
+          display_hash="${green}${hash}${reset}"
+          is_duplicate="true"
+          summary_duplicate_files=$((summary_duplicate_files + 1))
+        fi
+        prev_hash="$hash"
+      else
+        display_hash="<hash unavailable>"
+      fi
+
+      if [[ "$quiet" != "true" ]]; then
+        local display_name
+        display_name="$(format_name_field "${run_files[$i]}" "$display_hash" "$max_name_len" "false")"
+        printf "%s%b\n" "$display_name" "$display_hash"
+      fi
+    done
+    local processed_flags=()
     for (( i=0; i<entry_count; i++ )); do
       processed_flags+=("0")
     done
@@ -1318,7 +1453,24 @@ print_dedupe_group() {
       write_global_metadata_for_indices "$group_hash" "${indices[@]}"
     done
 
-    print_all_entries
+    for (( i=0; i<entry_count; i++ )); do
+      if [[ "${run_moved_flags[$i]}" != "1" ]]; then
+        continue
+      fi
+
+      local moved_display_hash
+      if [[ "${run_hash_valid[$i]}" == "1" ]]; then
+        moved_display_hash="${green}${run_hashes[$i]}${reset}"
+      elif [[ "${run_excluded_exec[$i]}" == "1" ]]; then
+        moved_display_hash="<excluded executable program>"
+      else
+        moved_display_hash="<hash unavailable>"
+      fi
+
+      local formatted_name
+      formatted_name="$(format_moved_name_field "${run_files[$i]}" "$moved_suffix" "$moved_display_hash" "$max_name_len")"
+      printf "%s%b\n" "$formatted_name" "$moved_display_hash"
+    done
     return
   fi
 
@@ -1533,6 +1685,17 @@ if is_prompt_delete_garbage_collect_mode; then
   gather_existing_dups_directories
   print_existing_dups_directories
   prompt_delete_dups_directories
+  exit 0
+fi
+
+if [[ "$move_dups_enabled" == "true" ]]; then
+  if ! is_move_dups_mode; then
+    echo "--move-dups must be used alone (or with only DIRECTORY root) and requires a destination path." >&2
+    exit 1
+  fi
+
+  gather_existing_dups_directories
+  move_existing_dups_directories "$move_dups_destination"
   exit 0
 fi
 

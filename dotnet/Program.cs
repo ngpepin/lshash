@@ -51,6 +51,10 @@ internal sealed class Options
 
     public bool PromptDelete { get; set; }
 
+    public bool MoveDups { get; set; }
+
+    public string? MoveDupsDestination { get; set; }
+
     public string RootDirectory { get; set; } = ".";
 }
 
@@ -193,6 +197,17 @@ internal static class Program
 
             WorkingDirectory = ResolveWorkingDirectory(options.RootDirectory);
 
+            if (options.MoveDups)
+            {
+                if (!IsMoveDupsMode(options))
+                {
+                    throw new ArgumentException("--move-dups must be used alone (or with only DIRECTORY root) and requires a destination path.");
+                }
+
+                RunMoveDupsMode(options.MoveDupsDestination!);
+                return 0;
+            }
+
             if (IsPromptDeleteGarbageCollectMode(options))
             {
                 RunPromptDeleteGarbageCollectMode();
@@ -287,6 +302,37 @@ internal static class Program
                 if (arg == "--prompt-delete")
                 {
                     options.PromptDelete = true;
+                    continue;
+                }
+
+                if (arg.StartsWith("--move-dups=", StringComparison.Ordinal))
+                {
+                    if (options.MoveDups)
+                    {
+                        throw new ArgumentException("--move-dups may only be provided once");
+                    }
+
+                    var destination = arg[12..];
+                    if (string.IsNullOrWhiteSpace(destination))
+                    {
+                        throw new ArgumentException("Missing value for --move-dups");
+                    }
+
+                    options.MoveDups = true;
+                    options.MoveDupsDestination = destination;
+                    continue;
+                }
+
+                if (arg == "--move-dups")
+                {
+                    if (options.MoveDups)
+                    {
+                        throw new ArgumentException("--move-dups may only be provided once");
+                    }
+
+                    argIndex = RequireValueIndex(args, argIndex, "--move-dups");
+                    options.MoveDups = true;
+                    options.MoveDupsDestination = args[argIndex];
                     continue;
                 }
 
@@ -512,7 +558,7 @@ internal static class Program
     {
         Console.WriteLine(
             """
-            Usage: lshash [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [--directory] [--global] [--prompt-delete] [-q|--quiet] [DIRECTORY]
+            Usage: lshash [--algorithm=NAME] [-r|--recursive] [-e PATTERN] [--exclude=PATTERN] [-d [MODE]] [--directory] [--global] [--prompt-delete] [--move-dups PATH] [-q|--quiet] [DIRECTORY]
 
             NAME can be one of:
               blake3, sha256, sha512, sha1, md5, blake2
@@ -534,6 +580,10 @@ internal static class Program
               --prompt-delete            With -d, after listing .dups directories, prompt y/N to delete them.
                                           When used alone (or with only DIRECTORY), recursively gather existing .dups directories,
                                           list them, and prompt y/N to delete them.
+              --move-dups PATH           Standalone mode: recursively gather existing .dups directories under DIRECTORY root
+                                         (or current directory), then move each .dups directory into PATH while preserving
+                                         root-relative tree structure.
+              --move-dups=PATH           Same as --move-dups PATH
               -q, --quiet                Only print duplicate (green) file lines
 
             Short-option stacking:
@@ -550,12 +600,28 @@ internal static class Program
               lshash -d --directory
               lshash -r -d shorter --global
               lshash --dedupe=longer
+                            lshash --move-dups /path/to/archive
+                            lshash --move-dups=/path/to/archive /path/to/scan
                             lshash --prompt-delete
                             lshash --prompt-delete /path/to/scan
               lshash -dr newer
               lshash -rq /path/to/scan
             """
         );
+    }
+
+    private static bool IsMoveDupsMode(Options options)
+    {
+        return options.MoveDups
+            && !options.DedupeEnabled
+            && !options.PromptDelete
+            && !options.Recursive
+            && options.ExcludePatterns.Count == 0
+            && !options.Quiet
+            && !options.AllDirectoryDedupe
+            && !options.GlobalDedupe
+            && options.Algorithm == HashAlgorithmKind.Blake3
+            && !string.IsNullOrWhiteSpace(options.MoveDupsDestination);
     }
 
     private static bool IsPromptDeleteGarbageCollectMode(Options options)
@@ -630,6 +696,77 @@ internal static class Program
         }
 
         PromptDeleteDupsDirectories(dupsDirectories);
+    }
+
+    private static void RunMoveDupsMode(string destinationPath)
+    {
+        var dupsDirectories = CollectExistingDupsDirectories();
+        if (dupsDirectories.Count == 0)
+        {
+            Console.WriteLine($"{Green}No .dups directories were found.{Reset}");
+            return;
+        }
+
+        var destinationAbsolute = ResolveMoveDupsDestination(destinationPath);
+        Directory.CreateDirectory(destinationAbsolute);
+
+        foreach (var source in dupsDirectories.OrderBy(path => path, StringComparer.Ordinal))
+        {
+            var relative = Path.GetRelativePath(WorkingDirectory, source);
+            if (relative == ".."
+                || relative.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.Ordinal)
+                || relative.StartsWith($"..{Path.AltDirectorySeparatorChar}", StringComparison.Ordinal))
+            {
+                Warn("move", source, "path is outside root directory");
+                continue;
+            }
+
+            var target = Path.GetFullPath(Path.Combine(destinationAbsolute, relative));
+            if (string.Equals(source, target, StringComparison.Ordinal))
+            {
+                Warn("move", ToUnixRelativePath(source), "source and destination are the same");
+                continue;
+            }
+
+            if (target.StartsWith(source + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                || target.StartsWith(source + Path.AltDirectorySeparatorChar, StringComparison.Ordinal))
+            {
+                Warn("move", ToUnixRelativePath(source), "destination is inside source directory");
+                continue;
+            }
+
+            var parent = Path.GetDirectoryName(target);
+            if (!string.IsNullOrWhiteSpace(parent))
+            {
+                Directory.CreateDirectory(parent);
+            }
+
+            if (Directory.Exists(target) || File.Exists(target))
+            {
+                Warn("move", ToUnixRelativePath(source), $"destination already exists: {target}");
+                continue;
+            }
+
+            try
+            {
+                Directory.Move(source, target);
+                Console.WriteLine($"{Green}{target}{Reset}");
+            }
+            catch (Exception ex)
+            {
+                Warn("move", ToUnixRelativePath(source), ex.Message);
+            }
+        }
+    }
+
+    private static string ResolveMoveDupsDestination(string destinationPath)
+    {
+        if (Path.IsPathRooted(destinationPath))
+        {
+            return Path.GetFullPath(destinationPath);
+        }
+
+        return Path.GetFullPath(Path.Combine(WorkingDirectory, destinationPath));
     }
 
     private static HashSet<string> CollectExistingDupsDirectories()
@@ -973,12 +1110,58 @@ internal static class Program
 
         if (allDirectoryDedupe)
         {
-            var entries = files.Select(file => BuildEntry(file, algorithm)).ToList();
+            var entries = new List<FileEntry>(files.Count);
+            foreach (var file in files)
+            {
+                var entry = BuildEntry(file, algorithm);
+                entries.Add(entry);
+
+                string displayHash;
+                var isDuplicate = false;
+                if (entry.ExcludedExecutableProgram)
+                {
+                    displayHash = "<excluded executable program>";
+                }
+                else if (entry.HashAvailable && entry.Hash is not null)
+                {
+                    isDuplicate = previousHash.Length > 0 && entry.Hash == previousHash;
+                    if (isDuplicate)
+                    {
+                        summaryStats.DuplicateFilesFound++;
+                    }
+
+                    displayHash = isDuplicate ? $"{Green}{entry.Hash}{Reset}" : entry.Hash;
+                    previousHash = entry.Hash;
+                }
+                else
+                {
+                    displayHash = "<hash unavailable>";
+                }
+
+                if (!quiet)
+                {
+                    var formattedName = FormatNameField(entry.RelativePath, displayHash, consoleWidth, maxNameLen, italicize: false);
+                    Console.WriteLine($"{formattedName}{displayHash}");
+                }
+            }
+
             ApplyAllDirectoryDedupe(entries);
 
             foreach (var entry in entries)
             {
-                PrintEntry(entry);
+                if (!entry.Moved)
+                {
+                    continue;
+                }
+
+                var movedDisplayHash = entry.HashAvailable && entry.Hash is not null
+                    ? $"{Green}{entry.Hash}{Reset}"
+                    : entry.ExcludedExecutableProgram
+                        ? "<excluded executable program>"
+                        : "<hash unavailable>";
+
+                var formattedName = FormatMovedNameField(entry.RelativePath, movedSuffix, movedDisplayHash, consoleWidth, maxNameLen);
+                Console.WriteLine($"{formattedName}{movedDisplayHash}");
             }
 
             return previousHash;
@@ -1033,7 +1216,41 @@ internal static class Program
         var consoleWidth = GetConsoleWidth();
         var previousHash = string.Empty;
 
-        var entries = files.Select(file => BuildEntry(file, algorithm)).ToList();
+        var entries = new List<FileEntry>(files.Count);
+        foreach (var file in files)
+        {
+            var entry = BuildEntry(file, algorithm);
+            entries.Add(entry);
+
+            string displayHash;
+            var isDuplicate = false;
+            if (entry.ExcludedExecutableProgram)
+            {
+                displayHash = "<excluded executable program>";
+            }
+            else if (entry.HashAvailable && entry.Hash is not null)
+            {
+                isDuplicate = previousHash.Length > 0 && entry.Hash == previousHash;
+                if (isDuplicate)
+                {
+                    summaryStats.DuplicateFilesFound++;
+                }
+
+                displayHash = isDuplicate ? $"{Green}{entry.Hash}{Reset}" : entry.Hash;
+                previousHash = entry.Hash;
+            }
+            else
+            {
+                displayHash = "<hash unavailable>";
+            }
+
+            if (!quiet)
+            {
+                var formattedName = FormatNameField(entry.RelativePath, displayHash, consoleWidth, maxNameLen, italicize: false);
+                Console.WriteLine($"{formattedName}{displayHash}");
+            }
+        }
+
         var groups = new Dictionary<string, List<int>>(StringComparer.Ordinal);
         for (var i = 0; i < entries.Count; i++)
         {
@@ -1091,37 +1308,18 @@ internal static class Program
 
         foreach (var entry in entries)
         {
-            string displayHash;
-            var isDuplicate = false;
-            if (entry.ExcludedExecutableProgram)
-            {
-                displayHash = "<excluded executable program>";
-            }
-            else if (entry.HashAvailable && entry.Hash is not null)
-            {
-                isDuplicate = previousHash.Length > 0 && entry.Hash == previousHash;
-                if (isDuplicate)
-                {
-                    summaryStats.DuplicateFilesFound++;
-                }
-
-                displayHash = isDuplicate ? $"{Green}{entry.Hash}{Reset}" : entry.Hash;
-                previousHash = entry.Hash;
-            }
-            else
-            {
-                displayHash = "<hash unavailable>";
-            }
-
-            if (quiet && !isDuplicate)
+            if (!entry.Moved)
             {
                 continue;
             }
 
-            var formattedName = entry.Moved
-                ? FormatMovedNameField(entry.RelativePath, movedSuffix, displayHash, consoleWidth, maxNameLen)
-                : FormatNameField(entry.RelativePath, displayHash, consoleWidth, maxNameLen, italicize: false);
-            Console.WriteLine($"{formattedName}{displayHash}");
+            var movedDisplayHash = entry.HashAvailable && entry.Hash is not null
+                ? $"{Green}{entry.Hash}{Reset}"
+                : entry.ExcludedExecutableProgram
+                    ? "<excluded executable program>"
+                    : "<hash unavailable>";
+            var formattedName = FormatMovedNameField(entry.RelativePath, movedSuffix, movedDisplayHash, consoleWidth, maxNameLen);
+            Console.WriteLine($"{formattedName}{movedDisplayHash}");
         }
     }
 
@@ -1716,8 +1914,24 @@ internal static class Program
     {
         try
         {
-            var attributes = File.GetAttributes(path);
-            return (attributes & FileAttributes.ReparsePoint) != 0;
+            FileSystemInfo info = Directory.Exists(path)
+                ? new DirectoryInfo(path)
+                : new FileInfo(path);
+
+            // Prefer LinkTarget to detect true symbolic links. Some network filesystems can
+            // expose reparse-like metadata that should not be treated as symlinks.
+            if (info.LinkTarget is not null)
+            {
+                return true;
+            }
+
+            // Keep Windows compatibility with reparse-point based links/junctions.
+            if (OperatingSystem.IsWindows())
+            {
+                return (info.Attributes & FileAttributes.ReparsePoint) != 0;
+            }
+
+            return false;
         }
         catch (Exception ex)
         {
