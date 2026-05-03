@@ -103,6 +103,8 @@ run_with_timeout() {
 
   if command -v timeout >/dev/null 2>&1; then
     timeout "$timeout_seconds" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$timeout_seconds" "$@"
   else
     "$@"
   fi
@@ -394,11 +396,52 @@ warn_file_issue() {
 try_hash_file() {
   local file="$1"
   local output
+  local hash_value
 
-  if output="$($hash_cmd -- "$file" 2>&1)"; then
-    awk '{print $1}' <<< "$output"
-    return 0
-  fi
+  case "$hash_mode" in
+    sum)
+      if output="$($hash_cmd -- "$file" 2>&1)"; then
+        hash_value="$(awk 'NR==1{print $1}' <<< "$output")"
+        if [[ -n "$hash_value" ]]; then
+          printf '%s\n' "$hash_value"
+          return 0
+        fi
+        warn_file_issue "hash" "$file" "unexpected empty hash output"
+        return 1
+      fi
+      ;;
+    shasum)
+      if output="$($hash_cmd -a "$hash_mode_arg" -- "$file" 2>&1)"; then
+        hash_value="$(awk 'NR==1{print $1}' <<< "$output")"
+        if [[ -n "$hash_value" ]]; then
+          printf '%s\n' "$hash_value"
+          return 0
+        fi
+        warn_file_issue "hash" "$file" "unexpected empty hash output"
+        return 1
+      fi
+      ;;
+    md5q)
+      local md5_input="$file"
+      if [[ "$md5_input" == -* ]]; then
+        md5_input="./$md5_input"
+      fi
+
+      if output="$($hash_cmd -q "$md5_input" 2>&1)"; then
+        hash_value="$(awk 'NR==1{print $1}' <<< "$output")"
+        if [[ -n "$hash_value" ]]; then
+          printf '%s\n' "$hash_value"
+          return 0
+        fi
+        warn_file_issue "hash" "$file" "unexpected empty hash output"
+        return 1
+      fi
+      ;;
+    *)
+      warn_file_issue "hash" "$file" "internal error: unknown hash mode '$hash_mode'"
+      return 1
+      ;;
+  esac
 
   warn_file_issue "hash" "$file" "$output"
   return 1
@@ -422,8 +465,14 @@ safe_move_file() {
   local target_path="$2"
   local output
 
-  if output="$(mv -- "$source_path" "$target_path" 2>&1)"; then
-    return 0
+  if [[ "$is_macos" == "true" ]]; then
+    if output="$(mv "$source_path" "$target_path" 2>&1)"; then
+      return 0
+    fi
+  else
+    if output="$(mv -- "$source_path" "$target_path" 2>&1)"; then
+      return 0
+    fi
   fi
 
   warn_file_issue "move" "$source_path" "$output"
@@ -764,10 +813,11 @@ has_any_execute_permission_bit() {
 
 has_shebang_prefix() {
   local file="$1"
-  local prefix
+  local first_two_hex
 
-  prefix="$(head -c 2 -- "$file" 2>/dev/null || true)"
-  [[ "$prefix" == '#!' ]]
+  # Avoid command-substitution on raw bytes (can contain NUL and trigger warnings on macOS Bash).
+  first_two_hex="$(dd if="$file" bs=1 count=2 2>/dev/null | od -An -tx1 -v | tr -d '[:space:]')"
+  [[ "$first_two_hex" == "2321" ]]
 }
 
 is_executable_program_for_dedupe() {
@@ -1716,22 +1766,66 @@ esac
 
 case "$algorithm" in
   blake3)
+    hash_mode="sum"
     hash_cmd="b3sum"
+    hash_mode_arg=""
     ;;
   sha256)
-    hash_cmd="sha256sum"
+    if command -v sha256sum >/dev/null 2>&1; then
+      hash_mode="sum"
+      hash_cmd="sha256sum"
+      hash_mode_arg=""
+    elif [[ "$is_macos" == "true" ]] && command -v shasum >/dev/null 2>&1; then
+      hash_mode="shasum"
+      hash_cmd="shasum"
+      hash_mode_arg="256"
+    else
+      hash_cmd=""
+    fi
     ;;
   sha512)
-    hash_cmd="sha512sum"
+    if command -v sha512sum >/dev/null 2>&1; then
+      hash_mode="sum"
+      hash_cmd="sha512sum"
+      hash_mode_arg=""
+    elif [[ "$is_macos" == "true" ]] && command -v shasum >/dev/null 2>&1; then
+      hash_mode="shasum"
+      hash_cmd="shasum"
+      hash_mode_arg="512"
+    else
+      hash_cmd=""
+    fi
     ;;
   sha1)
-    hash_cmd="sha1sum"
+    if command -v sha1sum >/dev/null 2>&1; then
+      hash_mode="sum"
+      hash_cmd="sha1sum"
+      hash_mode_arg=""
+    elif [[ "$is_macos" == "true" ]] && command -v shasum >/dev/null 2>&1; then
+      hash_mode="shasum"
+      hash_cmd="shasum"
+      hash_mode_arg="1"
+    else
+      hash_cmd=""
+    fi
     ;;
   md5)
-    hash_cmd="md5sum"
+    if command -v md5sum >/dev/null 2>&1; then
+      hash_mode="sum"
+      hash_cmd="md5sum"
+      hash_mode_arg=""
+    elif [[ "$is_macos" == "true" ]] && command -v md5 >/dev/null 2>&1; then
+      hash_mode="md5q"
+      hash_cmd="md5"
+      hash_mode_arg=""
+    else
+      hash_cmd=""
+    fi
     ;;
   blake2)
+    hash_mode="sum"
     hash_cmd="b2sum"
+    hash_mode_arg=""
     ;;
   *)
     echo "Unsupported algorithm: $algorithm" >&2
@@ -1740,15 +1834,33 @@ case "$algorithm" in
     ;;
 esac
 
-if ! command -v "$hash_cmd" >/dev/null 2>&1; then
+if [[ -z "${hash_cmd:-}" ]] || ! command -v "$hash_cmd" >/dev/null 2>&1; then
   if [[ "$algorithm" == "blake3" ]]; then
     echo "BLAKE3 requires 'b3sum', but it was not found." >&2
     if auto_install_b3sum; then
+      hash_mode="sum"
       hash_cmd="b3sum"
+      hash_mode_arg=""
     else
       echo "Auto-install failed. Install b3sum manually or use --algorithm=sha256 (or sha512/sha1/md5/blake2)." >&2
       exit 1
     fi
+  elif [[ "$is_macos" == "true" ]]; then
+    case "$algorithm" in
+      sha256|sha512|sha1)
+        echo "Required command not found for $algorithm." >&2
+        echo "On macOS, install coreutils for *sum commands, or ensure 'shasum' is available." >&2
+        ;;
+      md5)
+        echo "Required command not found for md5." >&2
+        echo "On macOS, install coreutils for md5sum, or ensure 'md5' is available." >&2
+        ;;
+      *)
+        echo "Required command not found: $hash_cmd" >&2
+        echo "Install coreutils (or equivalent) for this hash command." >&2
+        ;;
+    esac
+    exit 1
   else
     echo "Required command not found: $hash_cmd" >&2
     echo "Install coreutils (or equivalent) for this hash command." >&2

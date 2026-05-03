@@ -69,6 +69,7 @@ This separation of discovery and action supports safer change control, clearer g
 
 - The script now runs on macOS Catalina or later shell/tooling for traversal and sorting behavior.
 - Hash command requirements still apply by algorithm choice. On macOS, `blake3` is typically the easiest path because `b3sum` can be auto-installed when package tooling is available.
+- For non-BLAKE3 algorithms on macOS, the script prefers GNU `*sum` tools when installed, but automatically falls back to native commands where possible (`shasum` for `sha256`/`sha512`/`sha1`, and `md5` for `md5`).
 
 ### BLAKE3 auto-install behavior
 
