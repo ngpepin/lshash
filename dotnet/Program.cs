@@ -177,12 +177,23 @@ internal static class Program
     private const char MiddleDot = '\u00B7';
     private const Blake3Backend DefaultBlake3Backend = Blake3Backend.Cpu; // CPU by default
     private const int DefaultGpuMaxChunks = 1 << 20;
+    private const int DefaultReadBufferBytes = 1024 * 1024;
+    private const double WorkerInsensitiveDropRatio = 0.03;
+    private const double WorkerScaleUpGainRatio = 0.03;
+    private const double WorkerScaleDownRegressionRatio = 0.01;
+    private const double MinThroughputSampleSeconds = 0.001;
     private static readonly Regex AnsiEscapeRegex = new("\u001B\\[[0-9;]*m", RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly object Blake3BackendLock = new();
 
     private static string WorkingDirectory = Directory.GetCurrentDirectory();
     private static Blake3Backend? SelectedBlake3Backend;
     private static bool Blake3GpuFallbackLogged;
     private static int? CachedConsoleWidth;
+    private static int? CachedReadBufferBytes;
+    private static (int Start, int End)? CachedHashWorkerPlan;
+    private static string? CachedFileSystemType;
+
+    private readonly record struct HashResult(bool HashAvailable, string? Hash);
 
     private static int Main(string[] args)
     {
@@ -196,6 +207,8 @@ internal static class Program
             }
 
             WorkingDirectory = ResolveWorkingDirectory(options.RootDirectory);
+
+            MaybePrintPerformanceDiagnostics();
 
             if (options.MoveDups)
             {
@@ -639,9 +652,15 @@ internal static class Program
     private static void ProcessGlobalDedupe(Options options, SummaryStats summaryStats)
     {
         var files = new List<string>();
+        var diagnostics = GetPerformanceDiagnosticsContext();
 
         if (options.Recursive)
         {
+            if (diagnostics.Enabled)
+            {
+                Console.Error.WriteLine("Info: global dedupe: indexing files before adaptive hashing starts");
+            }
+
             foreach (var directory in EnumerateDirectoriesDepthFirst())
             {
                 summaryStats.DirectoriesTraversed++;
@@ -669,6 +688,11 @@ internal static class Program
         if (files.Count == 0)
         {
             return;
+        }
+
+        if (options.Recursive && diagnostics.Enabled)
+        {
+            Console.Error.WriteLine($"Info: global dedupe: indexed {files.Count} files, starting adaptive hashing");
         }
 
         if (!options.Recursive)
@@ -923,10 +947,13 @@ internal static class Program
     {
         var maxNameLen = files.Max(path => path.Length);
         var consoleWidth = GetConsoleWidth();
+        var hashResults = ComputeHashesInParallel(files, algorithm);
 
-        foreach (var file in files)
+        for (var i = 0; i < files.Count; i++)
         {
-            if (!TryComputeHash(file, algorithm, out var hash) || hash is null)
+            var file = files[i];
+            var result = hashResults[i];
+            if (!result.HashAvailable || result.Hash is null)
             {
                 if (!quiet)
                 {
@@ -939,6 +966,7 @@ internal static class Program
                 continue;
             }
 
+            var hash = result.Hash;
             var isDuplicate = previousHash.Length > 0 && hash == previousHash;
             if (isDuplicate)
             {
@@ -1110,12 +1138,9 @@ internal static class Program
 
         if (allDirectoryDedupe)
         {
-            var entries = new List<FileEntry>(files.Count);
-            foreach (var file in files)
+            var entries = BuildEntriesInParallel(files, algorithm);
+            foreach (var entry in entries)
             {
-                var entry = BuildEntry(file, algorithm);
-                entries.Add(entry);
-
                 string displayHash;
                 var isDuplicate = false;
                 if (entry.ExcludedExecutableProgram)
@@ -1167,10 +1192,9 @@ internal static class Program
             return previousHash;
         }
 
-        foreach (var file in files)
+        var precomputedEntries = BuildEntriesInParallel(files, algorithm);
+        foreach (var entry in precomputedEntries)
         {
-            var entry = BuildEntry(file, algorithm);
-
             if (!runActive)
             {
                 if (!entry.HashAvailable)
@@ -1216,12 +1240,9 @@ internal static class Program
         var consoleWidth = GetConsoleWidth();
         var previousHash = string.Empty;
 
-        var entries = new List<FileEntry>(files.Count);
-        foreach (var file in files)
+        var entries = BuildEntriesInParallel(files, algorithm);
+        foreach (var entry in entries)
         {
-            var entry = BuildEntry(file, algorithm);
-            entries.Add(entry);
-
             string displayHash;
             var isDuplicate = false;
             if (entry.ExcludedExecutableProgram)
@@ -1714,10 +1735,31 @@ internal static class Program
     private static string ComputeSystemHash(string filePath, HashAlgorithm algorithm)
     {
         using (algorithm)
-        using (var stream = File.OpenRead(filePath))
+        using (var stream = OpenSequentialReadStream(filePath))
         {
-            var hash = algorithm.ComputeHash(stream);
-            return Convert.ToHexString(hash).ToLowerInvariant();
+            var buffer = ArrayPool<byte>.Shared.Rent(GetReadBufferBytes());
+
+            try
+            {
+                while (true)
+                {
+                    var bytesRead = stream.Read(buffer, 0, buffer.Length);
+                    if (bytesRead == 0)
+                    {
+                        break;
+                    }
+
+                    algorithm.TransformBlock(buffer, 0, bytesRead, null, 0);
+                }
+
+                algorithm.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+                var hash = algorithm.Hash ?? throw new InvalidOperationException("Hash computation failed.");
+                return Convert.ToHexString(hash).ToLowerInvariant();
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
         }
     }
 
@@ -1735,13 +1777,23 @@ internal static class Program
         }
         catch (Exception ex) when (CanFallbackFromGpu(ex))
         {
-            if (!Blake3GpuFallbackLogged)
+            var logFallback = false;
+            lock (Blake3BackendLock)
             {
-                Console.Error.WriteLine($"Warning: GPU BLAKE3 backend unavailable ({ex.Message}). Falling back to CPU backend.");
-                Blake3GpuFallbackLogged = true;
+                if (!Blake3GpuFallbackLogged)
+                {
+                    Blake3GpuFallbackLogged = true;
+                    logFallback = true;
+                }
+
+                SelectedBlake3Backend = Blake3Backend.Cpu;
             }
 
-            SelectedBlake3Backend = Blake3Backend.Cpu;
+            if (logFallback)
+            {
+                Console.Error.WriteLine($"Warning: GPU BLAKE3 backend unavailable ({ex.Message}). Falling back to CPU backend.");
+            }
+
             return ComputeBlake3Cpu(filePath);
         }
     }
@@ -1761,23 +1813,31 @@ internal static class Program
             return SelectedBlake3Backend.Value;
         }
 
-        var configured = Environment.GetEnvironmentVariable("LSHASH_BLAKE3_BACKEND");
-        if (string.IsNullOrWhiteSpace(configured))
+        lock (Blake3BackendLock)
         {
-            SelectedBlake3Backend = DefaultBlake3Backend;
+            if (SelectedBlake3Backend is not null)
+            {
+                return SelectedBlake3Backend.Value;
+            }
+
+            var configured = Environment.GetEnvironmentVariable("LSHASH_BLAKE3_BACKEND");
+            if (string.IsNullOrWhiteSpace(configured))
+            {
+                SelectedBlake3Backend = DefaultBlake3Backend;
+                return SelectedBlake3Backend.Value;
+            }
+
+            SelectedBlake3Backend = configured.Trim().ToLowerInvariant() switch
+            {
+                "gpu" => Blake3Backend.Gpu,
+                "cpu" => Blake3Backend.Cpu,
+                _ => throw new InvalidOperationException(
+                    "Invalid LSHASH_BLAKE3_BACKEND value. Supported values: gpu, cpu."
+                ),
+            };
+
             return SelectedBlake3Backend.Value;
         }
-
-        SelectedBlake3Backend = configured.Trim().ToLowerInvariant() switch
-        {
-            "gpu" => Blake3Backend.Gpu,
-            "cpu" => Blake3Backend.Cpu,
-            _ => throw new InvalidOperationException(
-                "Invalid LSHASH_BLAKE3_BACKEND value. Supported values: gpu, cpu."
-            ),
-        };
-
-        return SelectedBlake3Backend.Value;
     }
 
     private static string ComputeBlake3Gpu(string filePath)
@@ -1790,11 +1850,11 @@ internal static class Program
     private static string ComputeBlake3Cpu(string filePath)
     {
         var hasher = Hasher.New();
-        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        var buffer = ArrayPool<byte>.Shared.Rent(GetReadBufferBytes());
 
         try
         {
-            using var stream = File.OpenRead(filePath);
+            using var stream = OpenSequentialReadStream(filePath);
             while (true)
             {
                 var bytesRead = stream.Read(buffer, 0, buffer.Length);
@@ -1871,11 +1931,11 @@ internal static class Program
     private static string ComputeBlake2b512(string filePath)
     {
         var digest = new Blake2bDigest(512);
-        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        var buffer = ArrayPool<byte>.Shared.Rent(GetReadBufferBytes());
 
         try
         {
-            using var stream = File.OpenRead(filePath);
+            using var stream = OpenSequentialReadStream(filePath);
             while (true)
             {
                 var bytesRead = stream.Read(buffer, 0, buffer.Length);
@@ -1944,6 +2004,424 @@ internal static class Program
     {
         var local = relativePath.Replace('/', Path.DirectorySeparatorChar);
         return Path.GetFullPath(Path.Combine(WorkingDirectory, local));
+    }
+
+    private static FileStream OpenSequentialReadStream(string filePath)
+    {
+        return new FileStream(filePath, new FileStreamOptions
+        {
+            Mode = FileMode.Open,
+            Access = FileAccess.Read,
+            Share = FileShare.ReadWrite | FileShare.Delete,
+            BufferSize = GetReadBufferBytes(),
+            Options = FileOptions.SequentialScan,
+        });
+    }
+
+    private static int GetReadBufferBytes()
+    {
+        if (CachedReadBufferBytes is not null)
+        {
+            return CachedReadBufferBytes.Value;
+        }
+
+        var configured = Environment.GetEnvironmentVariable("LSHASH_READ_BUFFER_KB");
+        if (string.IsNullOrWhiteSpace(configured))
+        {
+            CachedReadBufferBytes = DefaultReadBufferBytes;
+            return CachedReadBufferBytes.Value;
+        }
+
+        if (!int.TryParse(configured, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedKb) || parsedKb <= 0)
+        {
+            throw new InvalidOperationException("Invalid LSHASH_READ_BUFFER_KB value. It must be a positive integer.");
+        }
+
+        var bytes = checked(parsedKb * 1024);
+        CachedReadBufferBytes = bytes;
+        return CachedReadBufferBytes.Value;
+    }
+
+    private static HashResult[] ComputeHashesInParallel(List<string> files, HashAlgorithmKind algorithm)
+    {
+        var results = new HashResult[files.Count];
+        var estimatedBytes = EstimateFileSizes(files);
+
+        RunParallelWithAdaptiveWorkers(files.Count, index => estimatedBytes[index], index =>
+        {
+            var file = files[index];
+            if (TryComputeHash(file, algorithm, out var hash) && hash is not null)
+            {
+                results[index] = new HashResult(HashAvailable: true, Hash: hash);
+                return;
+            }
+
+            results[index] = new HashResult(HashAvailable: false, Hash: null);
+        });
+
+        return results;
+    }
+
+    private static List<FileEntry> BuildEntriesInParallel(List<string> files, HashAlgorithmKind algorithm)
+    {
+        var entries = new FileEntry[files.Count];
+        var estimatedBytes = EstimateFileSizes(files);
+
+        RunParallelWithAdaptiveWorkers(files.Count, index => estimatedBytes[index], index =>
+        {
+            entries[index] = BuildEntry(files[index], algorithm);
+        });
+
+        return entries.ToList();
+    }
+
+    private static long[] EstimateFileSizes(List<string> files)
+    {
+        var sizes = new long[files.Count];
+        for (var i = 0; i < files.Count; i++)
+        {
+            sizes[i] = TryGetFileSizeBytes(files[i]);
+        }
+
+        return sizes;
+    }
+
+    private static long TryGetFileSizeBytes(string relativePath)
+    {
+        try
+        {
+            return new FileInfo(GetAbsolutePath(relativePath)).Length;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static void RunParallelWithAdaptiveWorkers(int totalCount, Func<int, long> getWorkBytes, Action<int> action)
+    {
+        if (totalCount <= 0)
+        {
+            return;
+        }
+
+        var (startWorkers, endWorkers) = GetHashWorkerPlan();
+        var minWorkers = Math.Max(1, Math.Min(startWorkers, endWorkers));
+        var maxWorkers = Math.Max(1, Math.Max(startWorkers, endWorkers));
+        var workerStep = Math.Max(1, (maxWorkers - minWorkers) / 6);
+        var fsType = TryGetFileSystemTypeForWorkingDirectory();
+        var networkFs = IsNetworkFilesystemType(fsType);
+        var targetChunkCount = networkFs ? 512 : 48;
+        var minChunkSize = networkFs ? 1 : 64;
+        var maxChunkSize = networkFs ? 32 : 512;
+        var chunkSize = Math.Clamp((int)Math.Ceiling(totalCount / (double)targetChunkCount), minChunkSize, maxChunkSize);
+        var totalChunks = (totalCount + chunkSize - 1) / chunkSize;
+
+        var currentWorkers = Math.Clamp(startWorkers, minWorkers, maxWorkers);
+        var direction = currentWorkers > minWorkers
+            ? -1
+            : (currentWorkers < maxWorkers ? 1 : 0);
+        double? previousThroughput = null;
+        var previousWorkers = currentWorkers;
+        var lastReportedWorkers = currentWorkers;
+
+        for (var chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
+        {
+            var begin = chunkIndex * chunkSize;
+            var end = Math.Min(begin + chunkSize, totalCount);
+            if (begin >= end)
+            {
+                continue;
+            }
+
+            var options = new ParallelOptions { MaxDegreeOfParallelism = currentWorkers };
+            var stopwatch = Stopwatch.StartNew();
+            Parallel.For(begin, end, options, action);
+            stopwatch.Stop();
+
+            long chunkBytes = 0;
+            for (var i = begin; i < end; i++)
+            {
+                chunkBytes += Math.Max(getWorkBytes(i), 0);
+            }
+
+            var seconds = Math.Max(stopwatch.Elapsed.TotalSeconds, MinThroughputSampleSeconds);
+            var throughput = chunkBytes > 0
+                ? chunkBytes / seconds
+                : (end - begin) / seconds;
+
+            if (previousThroughput is not null)
+            {
+                var previous = previousThroughput.Value;
+                if (currentWorkers < previousWorkers)
+                {
+                    var insensitiveFloor = previous * (1.0 - WorkerInsensitiveDropRatio);
+                    direction = throughput >= insensitiveFloor ? -1 : 1;
+                }
+                else if (currentWorkers > previousWorkers)
+                {
+                    var improveFloor = previous * (1.0 + WorkerScaleUpGainRatio);
+                    var regressionFloor = previous * (1.0 - WorkerScaleDownRegressionRatio);
+                    if (throughput >= improveFloor)
+                    {
+                        direction = 1;
+                    }
+                    else if (throughput < regressionFloor)
+                    {
+                        direction = -1;
+                    }
+                }
+            }
+
+            previousThroughput = throughput;
+            previousWorkers = currentWorkers;
+
+            if (direction < 0)
+            {
+                if (currentWorkers > minWorkers)
+                {
+                    currentWorkers = Math.Max(minWorkers, currentWorkers - workerStep);
+                }
+                else if (currentWorkers < maxWorkers)
+                {
+                    direction = 1;
+                    currentWorkers = Math.Min(maxWorkers, currentWorkers + workerStep);
+                }
+            }
+            else if (direction > 0)
+            {
+                if (currentWorkers < maxWorkers)
+                {
+                    currentWorkers = Math.Min(maxWorkers, currentWorkers + workerStep);
+                }
+                else if (currentWorkers > minWorkers)
+                {
+                    direction = -1;
+                    currentWorkers = Math.Max(minWorkers, currentWorkers - workerStep);
+                }
+            }
+
+            if (Math.Abs(currentWorkers - lastReportedWorkers) >= 5)
+            {
+                // Disabled per request: suppress runtime worker change messages.
+                lastReportedWorkers = currentWorkers;
+            }
+        }
+    }
+
+    private static (int Start, int End) GetHashWorkerPlan()
+    {
+        if (CachedHashWorkerPlan is not null)
+        {
+            return CachedHashWorkerPlan.Value;
+        }
+
+        var configured = Environment.GetEnvironmentVariable("LSHASH_HASH_WORKERS");
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            if (!int.TryParse(configured, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) || parsed <= 0)
+            {
+                throw new InvalidOperationException("Invalid LSHASH_HASH_WORKERS value. It must be a positive integer.");
+            }
+
+            CachedHashWorkerPlan = (parsed, parsed);
+            return CachedHashWorkerPlan.Value;
+        }
+
+        var cpu = Math.Max(Environment.ProcessorCount, 1);
+        var fsType = TryGetFileSystemTypeForWorkingDirectory();
+        if (IsNetworkFilesystemType(fsType))
+        {
+            var endWorkers = Math.Clamp(cpu * 2, 8, 64);
+            var startWorkers = Math.Clamp(cpu * 4, 24, 192);
+            if (startWorkers < endWorkers)
+            {
+                startWorkers = endWorkers;
+            }
+
+            CachedHashWorkerPlan = (startWorkers, endWorkers);
+            return CachedHashWorkerPlan.Value;
+        }
+
+        var localEnd = Math.Clamp(cpu, 1, 32);
+        var localStart = Math.Clamp(cpu * 2, 4, 64);
+        if (localStart < localEnd)
+        {
+            localStart = localEnd;
+        }
+
+        CachedHashWorkerPlan = (localStart, localEnd);
+        return CachedHashWorkerPlan.Value;
+    }
+
+    private static int GetHashWorkers()
+    {
+        return GetHashWorkerPlan().End;
+    }
+
+    private static int GetInitialHashWorkers()
+    {
+        return GetHashWorkerPlan().Start;
+    }
+
+    private static (bool Enabled, string Source, string FsType) GetPerformanceDiagnosticsContext()
+    {
+        var fsType = TryGetFileSystemTypeForWorkingDirectory() ?? "unknown";
+        var forceForNetworkFs = IsNetworkFilesystemType(fsType);
+        var enabledByEnv = IsTruthyEnvValue(Environment.GetEnvironmentVariable("LSHASH_DIAGNOSTICS"));
+        var enabled = enabledByEnv || forceForNetworkFs;
+        var source = forceForNetworkFs && !enabledByEnv
+            ? "network-auto"
+            : "env";
+
+        return (enabled, source, fsType);
+    }
+
+    private static void MaybePrintPerformanceDiagnostics()
+    {
+        var diagnostics = GetPerformanceDiagnosticsContext();
+        if (!diagnostics.Enabled)
+        {
+            return;
+        }
+
+        var startWorkers = GetInitialHashWorkers();
+        var endWorkers = GetHashWorkers();
+        var readBufferKb = GetReadBufferBytes() / 1024;
+        var backend = ResolveBlake3Backend().ToString().ToLowerInvariant();
+
+        Console.Error.WriteLine(
+            $"Info: tuning diagnostics ({diagnostics.Source}): fsType={diagnostics.FsType}, hashWorkers={startWorkers}->{endWorkers}, readBufferKB={readBufferKb}, blake3Backend={backend}"
+        );
+    }
+
+    private static bool IsTruthyEnvValue(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "1" => true,
+            "true" => true,
+            "yes" => true,
+            "on" => true,
+            _ => false,
+        };
+    }
+
+    private static bool IsNetworkFilesystemType(string? fsType)
+    {
+        if (string.IsNullOrWhiteSpace(fsType))
+        {
+            return false;
+        }
+
+        return fsType switch
+        {
+            "cifs" => true,
+            "smb3" => true,
+            "smbfs" => true,
+            "nfs" => true,
+            "nfs4" => true,
+            "sshfs" => true,
+            "fuse.sshfs" => true,
+            _ => false,
+        };
+    }
+
+    private static string? TryGetFileSystemTypeForWorkingDirectory()
+    {
+        if (CachedFileSystemType is not null)
+        {
+            return CachedFileSystemType;
+        }
+
+        if (!OperatingSystem.IsLinux())
+        {
+            return null;
+        }
+
+        try
+        {
+            var normalizedPath = Path.GetFullPath(WorkingDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (normalizedPath.Length == 0)
+            {
+                normalizedPath = Path.DirectorySeparatorChar.ToString();
+            }
+
+            string? bestFsType = null;
+            var bestMountLength = -1;
+
+            foreach (var line in File.ReadLines("/proc/mounts"))
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 3)
+                {
+                    continue;
+                }
+
+                var mountPoint = DecodeProcMountField(parts[1]);
+                var mountPath = Path.GetFullPath(mountPoint).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                if (mountPath.Length == 0)
+                {
+                    mountPath = Path.DirectorySeparatorChar.ToString();
+                }
+
+                var pathMatches = string.Equals(normalizedPath, mountPath, StringComparison.Ordinal)
+                    || (mountPath == Path.DirectorySeparatorChar.ToString())
+                    || normalizedPath.StartsWith(mountPath + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                    || normalizedPath.StartsWith(mountPath + Path.AltDirectorySeparatorChar, StringComparison.Ordinal);
+
+                if (!pathMatches)
+                {
+                    continue;
+                }
+
+                if (mountPath.Length > bestMountLength)
+                {
+                    bestMountLength = mountPath.Length;
+                    bestFsType = parts[2].ToLowerInvariant();
+                }
+            }
+
+            CachedFileSystemType = bestFsType;
+            return CachedFileSystemType;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string DecodeProcMountField(string value)
+    {
+        var sb = new StringBuilder(value.Length);
+        for (var i = 0; i < value.Length; i++)
+        {
+            if (value[i] == '\\'
+                && i + 3 < value.Length
+                && value[i + 1] is >= '0' and <= '7'
+                && value[i + 2] is >= '0' and <= '7'
+                && value[i + 3] is >= '0' and <= '7')
+            {
+                var decoded = (char)((value[i + 1] - '0') * 64 + (value[i + 2] - '0') * 8 + (value[i + 3] - '0'));
+                sb.Append(decoded);
+                i += 3;
+                continue;
+            }
+
+            sb.Append(value[i]);
+        }
+
+        return sb.ToString();
     }
 
     private static string FormatNameField(string fileName, string displayHash, int consoleWidth, int fallbackNameWidth, bool italicize)
