@@ -17,7 +17,7 @@ Topic tags: rag, retrieval-augmented-generation, data-curation, data-governance,
 - Supports multiple hash algorithms.
 - Defaults to BLAKE3.
 - Can recurse into subdirectories.
-- Supports multiple exclusion patterns.
+- Supports built-in exclusions plus user-defined exclusion patterns.
 - Ignores `.dups/` directories by default.
 - In recursive mode, processes and prints results directory-by-directory as traversal encounters them.
 - Continues processing on per-file access errors and emits warnings instead of halting.
@@ -25,6 +25,7 @@ Topic tags: rag, retrieval-augmented-generation, data-curation, data-governance,
 - Optional dedupe mode to keep one file and move duplicates into hidden `.dups/` directories.
 - Prints a completion summary with duplicate counts and percentages.
 - Supports macOS Catalina-compatible traversal behavior (no GNU `find -printf` / `sort -z` dependency).
+- Built-in exclusions include common VCS/editor/temp artifacts and `*.lshash.json` sidecars.
 
 ## Upfront use-case perspective
 
@@ -164,14 +165,16 @@ The .NET implementation supports the same options as Bash (`--algorithm`, `-r/--
 - `--global`
   - With `-d/--dedupe` and `-r/--recursive`, dedupe by hash across the entire recursive tree
   - With `-d/--dedupe` without `-r/--recursive`, behaves like `--directory` on the selected directory
-  - Sidecar metadata files `<moved-file>.json` are created only in recursive global mode (`-r -d --global`)
+  - Sidecar metadata files `<moved-file>.lshash.json` are created only in recursive global mode (`-r -d --global`)
+  - In dedupe mode, any directory containing `.lshash-exclude` is skipped with descendants
   - Without `-d/--dedupe`, this flag is a no-op
 - `--prompt-delete`
   - With `-d/--dedupe`, after listing `.dups` directories, prompts `y/N` to delete them
   - Used alone (or with only `DIRECTORY`), recursively gathers existing `.dups` directories, lists them, and prompts `y/N` to delete them
   - When combined with other non-dedupe options, this flag is a no-op
 - `--move-dups PATH` / `--move-dups=PATH`
-  - Standalone mode (optionally scoped by `DIRECTORY`) that recursively finds existing `.dups` directories and moves them under `PATH`, preserving the source tree structure
+  - Standalone mode (optionally scoped by `DIRECTORY`) that recursively finds existing `.dups` directories and moves files from them under `PATH` using original relative paths
+  - Copying the resulting archive tree back onto the source tree restores duplicates (plus sidecars, when present)
 
 ### .NET BLAKE3 backend selection
 
@@ -254,6 +257,7 @@ cd dotnet/deploy/macos
 - `--exclude PATTERN`
 - `--exclude=PATTERN`
   - Exclude files matching glob pattern (repeatable)
+  - Built-in exclusions are always active (for example `.dups` traversal skip, `.lshash-exclude`, `.git/.hg/.svn`, `.gitignore`, `.mdexplore-*.json`, `*.lshash.json`, and common temp/editor files)
 - `-d [MODE]`, `--dedupe [MODE]`, `--dedup [MODE]`
 - `-d=MODE`, `--dedupe=MODE`, `--dedup=MODE`
   - Dedupe files with identical hash in the same directory
@@ -266,14 +270,16 @@ cd dotnet/deploy/macos
 - `--global`
   - With `-d/--dedupe` and `-r/--recursive`, dedupes by hash across all scanned files in the recursive tree (not per-directory)
   - With `-d/--dedupe` without `-r/--recursive`, behaves like `--directory` for the selected directory
-  - In recursive global mode (`-r -d --global`), each moved duplicate gets a sidecar metadata JSON file `<moved-file>.json` in `.dups/` describing duplicate peers (full paths) and statuses (`kept`/`moved`)
+  - In recursive global mode (`-r -d --global`), each moved duplicate gets a sidecar metadata JSON file `<moved-file>.lshash.json` in `.dups/` describing duplicate peers (full paths) and statuses (`kept`/`moved`)
+  - In dedupe mode, any directory containing `.lshash-exclude` is skipped with descendants
   - Without `-d/--dedupe`, no-op
 - `--prompt-delete`
   - With `-d/--dedupe`, after printing `.dups` directory paths, prompts `y/N` to delete them
   - Used alone (or with only `DIRECTORY`), recursively gathers existing `.dups` directories, lists them, and prompts `y/N` to delete them
   - When combined with other non-dedupe options, no-op
 - `--move-dups PATH` / `--move-dups=PATH`
-  - Standalone mode (optionally scoped by `DIRECTORY`) that recursively finds existing `.dups` directories and moves them under `PATH`, preserving root-relative structure
+  - Standalone mode (optionally scoped by `DIRECTORY`) that recursively finds existing `.dups` directories and moves files from them under `PATH` using original relative paths
+  - Copying that archive tree back over the source tree restores duplicates (plus sidecars, when present)
 - `-q`, `--quiet`
   - Only print duplicate lines (the lines that would be highlighted green in normal output)
   - Works with and without dedupe, and with and without recursive mode
@@ -306,7 +312,7 @@ When dedupe is enabled:
 - Tie-breaking rule: first file in sorted listing order is kept.
 - If a destination name already exists in `.dups/`, a `.dupN` suffix is added.
 - `--directory` provides a more thorough filename-blind mode that checks duplicates across the full directory. It only takes effect when used with `-d/--dedupe`.
-- `--global` extends dedupe scope across the full recursive tree when combined with `-d` and `-r`, and writes provenance JSON sidecars (`<moved-file>.json`) for moved files.
+- `--global` extends dedupe scope across the full recursive tree when combined with `-d` and `-r`, and writes provenance JSON sidecars (`<moved-file>.lshash.json`) for moved files.
 
 ### Dedupe scope matrix
 
@@ -315,13 +321,13 @@ When dedupe is enabled:
 | `-d` | Per directory | Contiguous same-hash runs in sorted filename order | Same directory `.dups/` | No |
 | `-d --directory` | Per directory | Full-directory hash grouping (filename adjacency ignored) | Same directory `.dups/` | No |
 | `-d --global` | Selected directory only | Full-directory hash grouping (same as `--directory`) | Same directory `.dups/` | No |
-| `-d -r --global` | Full recursive tree | Whole-tree hash grouping across directories | Each file's own source directory `.dups/` | Yes (`.json`) |
+| `-d -r --global` | Full recursive tree | Whole-tree hash grouping across directories | Each file's own source directory `.dups/` | Yes (`.lshash.json`) |
 
-### Global mode metadata (`<moved-file>.json`)
+### Global mode metadata (`<moved-file>.lshash.json`)
 
 In recursive `--global` mode (`-r -d --global`), every moved duplicate gets a sidecar metadata file next to it in `.dups/`:
 
-- Name: `<moved-file>.json`
+- Name: `<moved-file>.lshash.json`
 - Location: same `.dups/` directory as the moved file
 - Purpose: explain the duplicate set peers and which file was kept vs moved
 
@@ -418,7 +424,7 @@ This uses full-directory hash grouping for that single directory (same scope beh
 ./lshash.sh -r -d shorter --global /path/to/scan
 ```
 
-This compares hashable files across all directories in the tree, moves losers to each file's local `.dups/`, and writes `<moved-file>.json` sidecars.
+This compares hashable files across all directories in the tree, moves losers to each file's local `.dups/`, and writes `<moved-file>.lshash.json` sidecars.
 
 ### Global dedupe with a different keep policy
 
@@ -431,14 +437,14 @@ In each duplicate set, the newest file is kept in place and all others are moved
 ### Inspect generated sidecar metadata
 
 ```bash
-find /path/to/scan -path '*/.dups/*.json' -maxdepth 6 -print
-cat /path/to/scan/some/dir/.dups/example.txt.json
+find /path/to/scan -path '*/.dups/*.lshash.json' -maxdepth 6 -print
+cat /path/to/scan/some/dir/.dups/example.txt.lshash.json
 ```
 
 If `jq` is available:
 
 ```bash
-jq . /path/to/scan/some/dir/.dups/example.txt.json
+jq . /path/to/scan/some/dir/.dups/example.txt.lshash.json
 ```
 
 ### Only show duplicate lines
@@ -455,7 +461,7 @@ jq . /path/to/scan/some/dir/.dups/example.txt.json
 ./lshash.sh --prompt-delete /path/to/scan
 ```
 
-### Move existing `.dups` directories into an archive tree
+### Rehydrate duplicates from existing `.dups` into an archive tree
 
 ```bash
 ./lshash.sh --move-dups /path/to/archive
@@ -778,7 +784,7 @@ cd /home/npepin/Projects/lshash
 ./lshash.sh -r -d shorter --global /path/to/scan
 ```
 
-For each moved duplicate in recursive global mode (`-r -d --global`), a sidecar file `<moved-file>.json` is created in `.dups/` with peer paths and `kept`/`moved` status.
+For each moved duplicate in recursive global mode (`-r -d --global`), a sidecar file `<moved-file>.lshash.json` is created in `.dups/` with peer paths and `kept`/`moved` status.
 
 ### How do I dedupe but keep the shortest full relative path instead?
 
@@ -788,12 +794,14 @@ For each moved duplicate in recursive global mode (`-r -d --global`), a sidecar 
 
 This uses `shorter`, which compares full root-relative path length.
 
-### How do I archive existing `.dups` directories without re-running dedupe?
+### How do I archive existing `.dups` content without re-running dedupe?
 
 ```bash
 ./lshash.sh --move-dups /path/to/archive
 ./lshash.sh --move-dups=/path/to/archive /path/to/scan
 ```
+
+`--move-dups` writes files under the archive using original relative paths, so copying that archive tree back over the source tree restores duplicates (plus sidecars, when present).
 
 ### Where do moved duplicates go?
 

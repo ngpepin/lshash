@@ -21,7 +21,7 @@ flowchart LR
   CLI2 --> OUT
   CLI1 --> DUPS[.dups moves]
   CLI2 --> DUPS
-  DUPS --> META[Sidecar JSON in global recursive mode]
+   DUPS --> META[Sidecar .lshash.json in global recursive mode]
 ```
 
 ## 2. Shared behavioral contract
@@ -31,7 +31,7 @@ Both implementations follow the same behavior contract, validated by parity test
 ```mermaid
 flowchart TD
   A[Parse options] --> B{Standalone mode?}
-  B -->|move-dups mode| C[Move existing .dups trees]
+   B -->|move-dups mode| C[Rehydrate files from .dups into archive tree]
   B -->|prompt-delete only| D[GC existing .dups trees]
   B -->|normal scan| E[Enumerate files]
   E --> F[Hash + print]
@@ -95,13 +95,14 @@ flowchart TD
 flowchart TD
   A[Start at root] --> B[Enumerate directories depth-first]
   B --> C[Skip .dups dirs]
-  C --> D[Collect files in directory]
-  D --> E[Apply exclude patterns]
-  E --> F[Sort entries]
-  F --> G[Queue for hashing/printing]
-  G --> H{more directories?}
-  H -->|Yes| B
-  H -->|No| I[Emit summary]
+   C --> D[Prune .lshash-exclude dedupe branches]
+   D --> E[Collect files in directory]
+   E --> F[Apply built-in and user exclude patterns]
+   F --> G[Sort entries]
+   G --> H[Queue for hashing/printing]
+   H --> I{more directories?}
+   I -->|Yes| B
+   I -->|No| J[Emit summary]
 ```
 
 ## 4.2 Dedupe scope selection
@@ -243,7 +244,7 @@ sequenceDiagram
   S->>J: subject(path,status=moved)
   O->>J: others(path,status kept-or-moved)
   J->>J: serialize payload
-  J->>S: write moved-file.json sidecar in same .dups dir
+   J->>S: write moved-file.lshash.json sidecar in same .dups dir
 ```
 
 ## 9. Standalone maintenance modes
@@ -252,7 +253,7 @@ sequenceDiagram
 flowchart TD
   A[Start] --> B{move-dups mode}
   B -->|Yes| C[Collect existing .dups dirs]
-  C --> D[Move each dir to destination preserving tree]
+   C --> D[Move files from .dups to original relative paths under destination]
   D --> E[Done]
   B -->|No| F{prompt-delete only}
   F -->|Yes| G[Collect existing .dups dirs]

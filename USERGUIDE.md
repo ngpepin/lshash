@@ -72,6 +72,10 @@ What to look for:
 
 Use this to remove noise from your audit signal before dedupe.
 
+Note:
+
+- Built-in exclusions are always active (for example `.lshash-exclude`, `.git/.hg/.svn`, `.gitignore`, `.mdexplore-*.json`, `*.lshash.json`, `*.tmp`, and common editor/temp files).
+
 ## 6. Understand dedupe scopes before moving files
 
 The same `-d` switch behaves differently depending on scope flags:
@@ -88,7 +92,7 @@ The same `-d` switch behaves differently depending on scope flags:
 | `-d` | Per directory, contiguous runs | No |
 | `-d --directory` | Per directory, full hash grouping | No |
 | `-d --global` | Selected directory, full hash grouping | No |
-| `-d -r --global` | Full recursive tree | Yes (`<moved-file>.json`) |
+| `-d -r --global` | Full recursive tree | Yes (`<moved-file>.lshash.json`) |
 
 ## 7. Choose the keep policy (`MODE`)
 
@@ -139,13 +143,14 @@ Behavior:
 - Duplicate sets are formed across the entire recursive tree.
 - Moved files still go to each file's source directory `.dups/`.
 - A sidecar JSON is written per moved file:
-  - `<moved-file>.json`
+  - `<moved-file>.lshash.json`
   - includes peer paths and `kept`/`moved` statuses
+- In dedupe mode, directories containing `.lshash-exclude` are skipped with descendants.
 
 Inspect sidecars:
 
 ```bash
-find /path/to/corpus -path '*/.dups/*.json' -print
+find /path/to/corpus -path '*/.dups/*.lshash.json' -print
 ```
 
 ## 10. Quiet mode (`-q`)
@@ -175,9 +180,9 @@ find /path/to/corpus -path '*/.dups/*.json' -print
 
 Standalone `--prompt-delete` scans for existing `.dups` directories, lists them, and prompts once.
 
-## 12. Archive existing `.dups` trees with `--move-dups`
+## 12. Archive existing `.dups` content with `--move-dups`
 
-Use this when you want to reorganize `.dups` folders without re-running dedupe.
+Use this when you want to produce a restore-ready archive from existing `.dups` content without re-running dedupe.
 
 ```bash
 ./lshash.sh --move-dups /path/to/archive
@@ -187,7 +192,8 @@ Use this when you want to reorganize `.dups` folders without re-running dedupe.
 Behavior:
 
 - Recursively finds existing `.dups` directories under the selected root.
-- Moves them under destination while preserving root-relative tree structure.
+- Moves files out of `.dups` under destination using original relative paths.
+- Copying the destination tree back over the source tree restores duplicates (plus sidecars, when present).
 - This is a standalone mode (cannot be combined with normal scan/dedupe switches).
 
 ## 13. .NET runtime tuning (network-heavy scans)
