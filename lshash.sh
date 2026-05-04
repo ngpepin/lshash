@@ -5,6 +5,53 @@ set -euo pipefail
 algorithm="blake3"
 recursive="false"
 exclude_patterns=()
+default_exclude_patterns=(
+  ".lshash-exclude"
+  ".git"
+  "*/.git"
+  ".git/*"
+  "*/.git/*"
+  ".hg"
+  "*/.hg"
+  ".hg/*"
+  "*/.hg/*"
+  ".svn"
+  "*/.svn"
+  ".svn/*"
+  "*/.svn/*"
+  ".idea"
+  "*/.idea"
+  ".idea/*"
+  "*/.idea/*"
+  ".vscode"
+  "*/.vscode"
+  ".vscode/*"
+  "*/.vscode/*"
+  ".vs"
+  "*/.vs"
+  ".vs/*"
+  "*/.vs/*"
+  ".cache"
+  "*/.cache"
+  ".cache/*"
+  "*/.cache/*"
+  ".gitignore"
+  ".mdexplore-colors.json"
+  ".mdexplore-highlighting.json"
+  ".mdexplore-views.json"
+  "*.lshash.json"
+  "*.binoculars"
+  "*.tmp"
+  "*.temp"
+  "*.swp"
+  "*.swo"
+  "*~"
+  ".DS_Store"
+  "Thumbs.db"
+  "desktop.ini"
+  ".env.local"
+  ".env.*.local"
+)
 dedupe_enabled="false"
 dedupe_mode="shorter"
 all_directory="false"
@@ -60,12 +107,16 @@ Options:
       --global               With -d and -r, dedupe globally across all recursive files by hash
                  (ignores per-directory adjacency grouping).
              With -d only, behaves like --directory in the selected directory.
+              Any directory containing .lshash-exclude is skipped with its descendants.
+           Built-in exclusions include .lshash-exclude, .git/.hg/.svn, .gitignore,
+           .mdexplore-*.json, *.binoculars, *.tmp, and common temp/editor artifacts.
       --prompt-delete        With -d, after listing .dups directories, prompt y/N to delete them.
                  Used alone (or with only DIRECTORY), recursively gather existing
                  .dups directories, list them, and prompt y/N to delete them.
       --move-dups PATH       Standalone mode: recursively gather existing .dups directories
-             under DIRECTORY root (or current directory), then move each .dups
-             directory into PATH while preserving root-relative tree structure.
+              under DIRECTORY root (or current directory), then move files from
+              each .dups directory into PATH using original relative paths.
+              Copying PATH back onto the source tree restores duplicates.
       --move-dups=PATH       Same as --move-dups PATH
   -q, --quiet                Only print duplicate (green) file lines
 
@@ -384,6 +435,12 @@ should_exclude() {
   local path="$1"
   local pattern
 
+  for pattern in "${default_exclude_patterns[@]}"; do
+    if [[ "$path" == $pattern ]]; then
+      return 0
+    fi
+  done
+
   for pattern in "${exclude_patterns[@]}"; do
     if [[ "$path" == $pattern ]]; then
       return 0
@@ -391,6 +448,35 @@ should_exclude() {
   done
 
   return 1
+}
+
+is_dedupe_excluded_directory() {
+  local dir_rel="$1"
+  [[ "$dedupe_enabled" == "true" ]] || return 1
+
+  local marker_path
+  if [[ "$dir_rel" == "." ]]; then
+    marker_path="./.lshash-exclude"
+  else
+    marker_path="$dir_rel/.lshash-exclude"
+  fi
+
+  [[ -f "$marker_path" ]]
+}
+
+print_dedupe_excluded_directory_notice() {
+  local dir_rel="$1"
+  [[ "$quiet" == "true" ]] && return
+
+  local display_hash="<excluded: directory and children ignored due to .lshash-exclude>"
+  local fallback_width=${#dir_rel}
+  if (( fallback_width <= 0 )); then
+    fallback_width=1
+  fi
+
+  local display_name
+  display_name="$(format_name_field "$dir_rel" "$display_hash" "$fallback_width" "false")"
+  printf '%s%s\n' "$display_name" "$display_hash"
 }
 
 warn_file_issue() {
@@ -646,25 +732,64 @@ move_existing_dups_directories() {
       continue
     fi
 
-    local target_abs="$destination_abs/$rel_path"
-    if [[ "$source_abs" == "$target_abs" ]]; then
-      warn_file_issue "move" "$source_abs" "source and destination are the same"
+    local relative_original_dir
+    if [[ "$rel_path" == ".dups" ]]; then
+      relative_original_dir=""
+    elif [[ "$rel_path" == */.dups ]]; then
+      relative_original_dir="${rel_path%/.dups}"
+    else
+      warn_file_issue "move" "$source_abs" "unexpected .dups path layout"
       continue
     fi
 
-    local target_parent="${target_abs%/*}"
-    if ! mkdir -p -- "$target_parent" 2>/dev/null; then
-      warn_file_issue "create" "$target_parent" "failed to create target parent directory"
-      continue
+    local target_base="$destination_abs"
+    if [[ -n "$relative_original_dir" ]]; then
+      target_base="$destination_abs/$relative_original_dir"
     fi
 
-    if [[ -e "$target_abs" ]]; then
-      warn_file_issue "move" "$source_abs" "destination already exists: $target_abs"
-      continue
-    fi
+    local source_files=()
+    local source_file
+    while IFS= read -r source_file; do
+      [[ -z "$source_file" ]] && continue
+      source_files+=("$source_file")
+    done < <(find "$source_abs" -type f -print | LC_ALL=C sort)
 
-    if safe_move_file "$source_abs" "$target_abs"; then
-      printf '%b%s%b\n' "$green" "$target_abs" "$reset"
+    local moved_any="false"
+    local file_abs
+    for file_abs in "${source_files[@]}"; do
+      local rel_inside
+      if [[ "$file_abs" == "$source_abs"/* ]]; then
+        rel_inside="${file_abs#$source_abs/}"
+      else
+        warn_file_issue "move" "$file_abs" "file is outside expected .dups directory"
+        continue
+      fi
+
+      local target_abs="$target_base/$rel_inside"
+      if [[ "$file_abs" == "$target_abs" ]]; then
+        warn_file_issue "move" "$file_abs" "source and destination are the same"
+        continue
+      fi
+
+      local target_parent="${target_abs%/*}"
+      if ! mkdir -p -- "$target_parent" 2>/dev/null; then
+        warn_file_issue "create" "$target_parent" "failed to create target parent directory"
+        continue
+      fi
+
+      if [[ -e "$target_abs" ]]; then
+        warn_file_issue "move" "$file_abs" "destination already exists: $target_abs"
+        continue
+      fi
+
+      if safe_move_file "$file_abs" "$target_abs"; then
+        moved_any="true"
+        printf '%b%s%b\n' "$green" "$target_abs" "$reset"
+      fi
+    done
+
+    if [[ "$moved_any" == "true" ]]; then
+      find "$source_abs" -depth -type d -empty -exec rmdir {} + 2>/dev/null || true
     fi
   done <<< "$sorted_dups"
 }
@@ -1190,7 +1315,7 @@ print_dedupe_group() {
       local subject_path="${run_moved_paths[$subject_idx]}"
       [[ -n "$subject_path" ]] || continue
 
-      local metadata_path="${subject_path}.json"
+      local metadata_path="${subject_path}.lshash.json"
       local escaped_hash
       escaped_hash="$(json_escape "$hash")"
       local escaped_mode
@@ -1660,6 +1785,11 @@ collect_files_for_directory() {
     search_dir="$dir_rel"
   fi
 
+  if is_dedupe_excluded_directory "$dir_rel"; then
+    print_dedupe_excluded_directory_notice "$dir_rel"
+    return
+  fi
+
   local names=()
   local candidate
   shopt -s nullglob dotglob
@@ -1704,6 +1834,10 @@ collect_subdirs_for_directory() {
     search_dir="$dir_rel"
   fi
 
+  if is_dedupe_excluded_directory "$dir_rel"; then
+    return
+  fi
+
   local names=()
   local candidate
   shopt -s nullglob dotglob
@@ -1723,6 +1857,17 @@ collect_subdirs_for_directory() {
 
     while IFS= read -r name; do
       [[ -z "$name" ]] && continue
+      local rel
+      if [[ "$dir_rel" == "." ]]; then
+        rel="$name"
+      else
+        rel="$dir_rel/$name"
+      fi
+
+      if should_exclude "$rel" || should_exclude "$rel/"; then
+        continue
+      fi
+
       current_subdirs+=("$name")
     done <<< "$sorted_blob"
   fi

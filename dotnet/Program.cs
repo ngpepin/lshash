@@ -169,6 +169,8 @@ internal sealed class Blake3GpuContext : IDisposable
 
 internal static class Program
 {
+    private const string DedupeExcludeMarkerFileName = ".lshash-exclude";
+    private const string DedupeExcludedDirectoryMessage = "<excluded: directory and children ignored due to .lshash-exclude>";
     private const string BoldYellow = "\u001b[1;33m";
     private const string Green = "\u001b[32m";
     private const string Gray = "\u001b[37m";
@@ -183,6 +185,54 @@ internal static class Program
     private const double WorkerScaleDownRegressionRatio = 0.01;
     private const double MinThroughputSampleSeconds = 0.001;
     private static readonly Regex AnsiEscapeRegex = new("\u001B\\[[0-9;]*m", RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly string[] DefaultExcludePatterns =
+    {
+        ".lshash-exclude",
+        ".git",
+        "*/.git",
+        ".git/*",
+        "*/.git/*",
+        ".hg",
+        "*/.hg",
+        ".hg/*",
+        "*/.hg/*",
+        ".svn",
+        "*/.svn",
+        ".svn/*",
+        "*/.svn/*",
+        ".idea",
+        "*/.idea",
+        ".idea/*",
+        "*/.idea/*",
+        ".vscode",
+        "*/.vscode",
+        ".vscode/*",
+        "*/.vscode/*",
+        ".vs",
+        "*/.vs",
+        ".vs/*",
+        "*/.vs/*",
+        ".cache",
+        "*/.cache",
+        ".cache/*",
+        "*/.cache/*",
+        ".gitignore",
+        ".mdexplore-colors.json",
+        ".mdexplore-highlighting.json",
+        ".mdexplore-views.json",
+        "*.lshash.json",
+        "*.binoculars",
+        "*.tmp",
+        "*.temp",
+        "*.swp",
+        "*.swo",
+        "*~",
+        ".DS_Store",
+        "Thumbs.db",
+        "desktop.ini",
+        ".env.local",
+        ".env.*.local",
+    };
     private static readonly object Blake3BackendLock = new();
 
     private static string WorkingDirectory = Directory.GetCurrentDirectory();
@@ -590,12 +640,15 @@ internal static class Program
               --all-directory            Backward-compatible alias for --directory
               --global                   With -d and -r, dedupe globally across the full recursive tree by hash.
                                          With -d only, behaves like --directory for the selected directory.
+                                         Any directory containing .lshash-exclude is skipped with its descendants.
+                                         Built-in exclusions include .lshash-exclude, .git/.hg/.svn, .gitignore,
+                                         .mdexplore-*.json, *.binoculars, *.tmp, and common temp/editor artifacts.
               --prompt-delete            With -d, after listing .dups directories, prompt y/N to delete them.
                                           When used alone (or with only DIRECTORY), recursively gather existing .dups directories,
                                           list them, and prompt y/N to delete them.
               --move-dups PATH           Standalone mode: recursively gather existing .dups directories under DIRECTORY root
-                                         (or current directory), then move each .dups directory into PATH while preserving
-                                         root-relative tree structure.
+                                         (or current directory), then move files from each .dups directory into PATH
+                                         using original relative paths. Copying PATH back onto the source tree restores duplicates.
               --move-dups=PATH           Same as --move-dups PATH
               -q, --quiet                Only print duplicate (green) file lines
 
@@ -661,27 +714,33 @@ internal static class Program
                 Console.Error.WriteLine("Info: global dedupe: indexing files before adaptive hashing starts");
             }
 
-            foreach (var directory in EnumerateDirectoriesDepthFirst())
+            foreach (var directory in EnumerateDirectoriesDepthFirst(options.DedupeEnabled, options.ExcludePatterns))
             {
                 summaryStats.DirectoriesTraversed++;
-                var directoryFiles = GetFilesForDirectory(directory);
-                if (options.ExcludePatterns.Count > 0)
+                if (options.DedupeEnabled && IsDedupeExcludedDirectory(directory))
                 {
-                    directoryFiles = directoryFiles
-                        .Where(path => !options.ExcludePatterns.Any(pattern => GlobMatch(path, pattern)))
-                        .ToList();
+                    PrintDedupeExcludedDirectoryNotice(directory, options.Quiet);
+                    continue;
                 }
+
+                var directoryFiles = GetFilesForDirectory(directory);
+                directoryFiles = directoryFiles
+                    .Where(path => !ShouldExcludePath(path, options.ExcludePatterns))
+                    .ToList();
 
                 files.AddRange(directoryFiles);
             }
         }
         else
         {
-            files = GetFilesForDirectory(".");
-            if (options.ExcludePatterns.Count > 0)
+            if (options.DedupeEnabled && IsDedupeExcludedDirectory("."))
             {
-                files = files.Where(path => !options.ExcludePatterns.Any(pattern => GlobMatch(path, pattern))).ToList();
+                PrintDedupeExcludedDirectoryNotice(".", options.Quiet);
+                return;
             }
+
+            files = GetFilesForDirectory(".");
+            files = files.Where(path => !ShouldExcludePath(path, options.ExcludePatterns)).ToList();
         }
 
         summaryStats.TotalFilesScanned += files.Count;
@@ -745,41 +804,123 @@ internal static class Program
                 continue;
             }
 
-            var target = Path.GetFullPath(Path.Combine(destinationAbsolute, relative));
-            if (string.Equals(source, target, StringComparison.Ordinal))
+            if (!string.Equals(Path.GetFileName(source), ".dups", StringComparison.Ordinal))
             {
-                Warn("move", ToUnixRelativePath(source), "source and destination are the same");
+                Warn("move", ToUnixRelativePath(source), "unexpected .dups path layout");
                 continue;
             }
 
-            if (target.StartsWith(source + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-                || target.StartsWith(source + Path.AltDirectorySeparatorChar, StringComparison.Ordinal))
+            var sourceParent = Path.GetDirectoryName(source);
+            if (string.IsNullOrWhiteSpace(sourceParent))
             {
-                Warn("move", ToUnixRelativePath(source), "destination is inside source directory");
+                Warn("move", ToUnixRelativePath(source), "failed to resolve source parent directory");
                 continue;
             }
 
-            var parent = Path.GetDirectoryName(target);
-            if (!string.IsNullOrWhiteSpace(parent))
+            var relativeOriginalDir = Path.GetRelativePath(WorkingDirectory, sourceParent);
+            if (relativeOriginalDir == ".."
+                || relativeOriginalDir.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.Ordinal)
+                || relativeOriginalDir.StartsWith($"..{Path.AltDirectorySeparatorChar}", StringComparison.Ordinal))
             {
-                Directory.CreateDirectory(parent);
-            }
-
-            if (Directory.Exists(target) || File.Exists(target))
-            {
-                Warn("move", ToUnixRelativePath(source), $"destination already exists: {target}");
+                Warn("move", ToUnixRelativePath(source), "path is outside root directory");
                 continue;
             }
 
+            if (string.Equals(relativeOriginalDir, ".", StringComparison.Ordinal))
+            {
+                relativeOriginalDir = string.Empty;
+            }
+
+            var targetBase = string.IsNullOrEmpty(relativeOriginalDir)
+                ? destinationAbsolute
+                : Path.GetFullPath(Path.Combine(destinationAbsolute, relativeOriginalDir));
+
+            List<string> sourceFiles;
             try
             {
-                Directory.Move(source, target);
-                Console.WriteLine($"{Green}{target}{Reset}");
+                sourceFiles = Directory
+                    .EnumerateFiles(source, "*", SearchOption.AllDirectories)
+                    .OrderBy(path => path, StringComparer.Ordinal)
+                    .ToList();
             }
             catch (Exception ex)
             {
                 Warn("move", ToUnixRelativePath(source), ex.Message);
+                continue;
             }
+
+            var movedAny = false;
+            foreach (var sourceFile in sourceFiles)
+            {
+                var relInside = Path.GetRelativePath(source, sourceFile);
+                var targetPath = Path.GetFullPath(Path.Combine(targetBase, relInside));
+
+                if (string.Equals(sourceFile, targetPath, StringComparison.Ordinal))
+                {
+                    Warn("move", ToUnixRelativePath(sourceFile), "source and destination are the same");
+                    continue;
+                }
+
+                var parent = Path.GetDirectoryName(targetPath);
+                if (!string.IsNullOrWhiteSpace(parent))
+                {
+                    Directory.CreateDirectory(parent);
+                }
+
+                if (Directory.Exists(targetPath) || File.Exists(targetPath))
+                {
+                    Warn("move", ToUnixRelativePath(sourceFile), $"destination already exists: {targetPath}");
+                    continue;
+                }
+
+                try
+                {
+                    File.Move(sourceFile, targetPath);
+                    movedAny = true;
+                    Console.WriteLine($"{Green}{targetPath}{Reset}");
+                }
+                catch (Exception ex)
+                {
+                    Warn("move", ToUnixRelativePath(sourceFile), ex.Message);
+                }
+            }
+
+            if (movedAny)
+            {
+                TryDeleteEmptyDirectoryTree(source);
+            }
+        }
+    }
+
+    private static void TryDeleteEmptyDirectoryTree(string root)
+    {
+        try
+        {
+            foreach (var dir in Directory
+                .EnumerateDirectories(root, "*", SearchOption.AllDirectories)
+                .OrderByDescending(path => path.Length))
+            {
+                try
+                {
+                    if (!Directory.EnumerateFileSystemEntries(dir).Any())
+                    {
+                        Directory.Delete(dir);
+                    }
+                }
+                catch
+                {
+                    // Ignore non-empty or concurrently changed directories.
+                }
+            }
+
+            if (!Directory.EnumerateFileSystemEntries(root).Any())
+            {
+                Directory.Delete(root);
+            }
+        }
+        catch
+        {
+            // Best effort cleanup only.
         }
     }
 
@@ -839,7 +980,7 @@ internal static class Program
     private static void ProcessRecursive(Options options, SummaryStats summaryStats)
     {
         var previousHash = string.Empty;
-        foreach (var directory in EnumerateDirectoriesDepthFirst())
+        foreach (var directory in EnumerateDirectoriesDepthFirst(options.DedupeEnabled, options.ExcludePatterns))
         {
             summaryStats.DirectoriesTraversed++;
             ProcessDirectory(directory, options, summaryStats, ref previousHash);
@@ -854,11 +995,14 @@ internal static class Program
 
     private static void ProcessDirectory(string directory, Options options, SummaryStats summaryStats, ref string previousHash)
     {
-        var files = GetFilesForDirectory(directory);
-        if (options.ExcludePatterns.Count > 0)
+        if (options.DedupeEnabled && IsDedupeExcludedDirectory(directory))
         {
-            files = files.Where(path => !options.ExcludePatterns.Any(pattern => GlobMatch(path, pattern))).ToList();
+            PrintDedupeExcludedDirectoryNotice(directory, options.Quiet);
+            return;
         }
+
+        var files = GetFilesForDirectory(directory);
+        files = files.Where(path => !ShouldExcludePath(path, options.ExcludePatterns)).ToList();
 
         summaryStats.TotalFilesScanned += files.Count;
 
@@ -877,7 +1021,7 @@ internal static class Program
         }
     }
 
-    private static IEnumerable<string> EnumerateDirectoriesDepthFirst()
+    private static IEnumerable<string> EnumerateDirectoriesDepthFirst(bool dedupeEnabled, IReadOnlyList<string> excludePatterns)
     {
         var stack = new Stack<string>();
         stack.Push(".");
@@ -885,7 +1029,18 @@ internal static class Program
         while (stack.Count > 0)
         {
             var dir = stack.Pop();
+
+            if (dir != "." && ShouldExcludeDirectory(dir, excludePatterns))
+            {
+                continue;
+            }
+
             yield return dir;
+
+            if (dedupeEnabled && IsDedupeExcludedDirectory(dir))
+            {
+                continue;
+            }
 
             var absoluteDir = dir == "." ? WorkingDirectory : GetAbsolutePath(dir);
             List<string> subDirs;
@@ -908,9 +1063,76 @@ internal static class Program
             for (var i = subDirs.Count - 1; i >= 0; i--)
             {
                 var child = subDirs[i];
-                stack.Push(dir == "." ? child : $"{dir}/{child}");
+                var childRel = dir == "." ? child : $"{dir}/{child}";
+                if (ShouldExcludeDirectory(childRel, excludePatterns))
+                {
+                    continue;
+                }
+
+                stack.Push(childRel);
             }
         }
+    }
+
+    private static bool ShouldExcludeDirectory(string directory, IReadOnlyList<string> userPatterns)
+    {
+        if (directory == ".")
+        {
+            return false;
+        }
+
+        return ShouldExcludePath(directory, userPatterns)
+            || ShouldExcludePath($"{directory}/", userPatterns);
+    }
+
+    private static bool ShouldExcludePath(string relativePath, IReadOnlyList<string> userPatterns)
+    {
+        var normalized = relativePath.Replace('\\', '/');
+
+        foreach (var pattern in DefaultExcludePatterns)
+        {
+            if (GlobMatch(normalized, pattern))
+            {
+                return true;
+            }
+        }
+
+        foreach (var pattern in userPatterns)
+        {
+            if (GlobMatch(normalized, pattern))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsDedupeExcludedDirectory(string directory)
+    {
+        try
+        {
+            var absoluteDir = directory == "." ? WorkingDirectory : GetAbsolutePath(directory);
+            var markerPath = Path.Combine(absoluteDir, DedupeExcludeMarkerFileName);
+            return File.Exists(markerPath);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void PrintDedupeExcludedDirectoryNotice(string directory, bool quiet)
+    {
+        if (quiet)
+        {
+            return;
+        }
+
+        var consoleWidth = GetConsoleWidth();
+        var maxNameLen = Math.Max(directory.Length, 1);
+        var displayName = FormatNameField(directory, DedupeExcludedDirectoryMessage, consoleWidth, maxNameLen, italicize: false);
+        Console.WriteLine($"{displayName}{DedupeExcludedDirectoryMessage}");
     }
 
     private static List<string> GetFilesForDirectory(string directory)
@@ -1375,7 +1597,7 @@ internal static class Program
                 others,
             };
 
-            var metadataPath = subject.MovedToPath + ".json";
+            var metadataPath = subject.MovedToPath + ".lshash.json";
             try
             {
                 var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
