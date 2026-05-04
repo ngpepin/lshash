@@ -27,6 +27,13 @@ is_macos="false"
 if [[ "$platform_name" == "Darwin" ]]; then
   is_macos="true"
 fi
+
+# macOS ships Bash 3.2 by default; with nounset enabled, expanding empty arrays
+# can raise "unbound variable" even when arrays were initialized intentionally.
+# Keep strict nounset on newer shells, but relax it for legacy Bash.
+if [[ "${BASH_VERSINFO[0]:-0}" -lt 4 ]]; then
+  set +u
+fi
 current_group_files=()
 current_subdirs=()
 global_scope_active="false"
@@ -507,10 +514,13 @@ print_dups_directories() {
   fi
 
   local dir
+  local sorted_dups
+  sorted_dups="$(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)"
+
   while IFS= read -r dir; do
     [[ -z "$dir" ]] && continue
     printf '%b%s%b\n' "$green" "$dir" "$reset"
-  done < <(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)
+  done <<< "$sorted_dups"
 }
 
 prompt_delete_dups_directories() {
@@ -535,12 +545,15 @@ prompt_delete_dups_directories() {
   fi
 
   local dir
+  local sorted_dups
+  sorted_dups="$(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)"
+
   while IFS= read -r dir; do
     [[ -z "$dir" ]] && continue
     if ! rm -rf -- "$dir" 2>/dev/null; then
       warn_file_issue "delete" "$dir" "failed to remove directory"
     fi
-  done < <(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)
+  done <<< "$sorted_dups"
 }
 
 print_existing_dups_directories() {
@@ -553,10 +566,13 @@ print_existing_dups_directories() {
   fi
 
   local dir
+  local sorted_dups
+  sorted_dups="$(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)"
+
   while IFS= read -r dir; do
     [[ -z "$dir" ]] && continue
     printf '%b%s%b\n' "$green" "$dir" "$reset"
-  done < <(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)
+  done <<< "$sorted_dups"
 }
 
 is_prompt_delete_garbage_collect_mode() {
@@ -614,6 +630,9 @@ move_existing_dups_directories() {
   root_abs="$(pwd -P)"
 
   local source_abs
+  local sorted_dups
+  sorted_dups="$(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)"
+
   while IFS= read -r source_abs; do
     [[ -z "$source_abs" ]] && continue
 
@@ -647,7 +666,7 @@ move_existing_dups_directories() {
     if safe_move_file "$source_abs" "$target_abs"; then
       printf '%b%s%b\n' "$green" "$target_abs" "$reset"
     fi
-  done < <(printf '%s\n' "${dups_dirs[@]}" | LC_ALL=C sort)
+  done <<< "$sorted_dups"
 }
 
 gather_existing_dups_directories() {
@@ -684,10 +703,13 @@ gather_existing_dups_directories() {
     local sorted_names=()
     local name
     if (( ${#names[@]} > 0 )); then
+      local sorted_blob
+      sorted_blob="$(printf '%s\n' "${names[@]}" | LC_ALL=C sort)"
+
       while IFS= read -r name; do
         [[ -z "$name" ]] && continue
         sorted_names+=("$name")
-      done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort)
+      done <<< "$sorted_blob"
     fi
 
     local i
@@ -1650,6 +1672,9 @@ collect_files_for_directory() {
 
   local name
   if (( ${#names[@]} > 0 )); then
+    local sorted_blob
+    sorted_blob="$(printf '%s\n' "${names[@]}" | LC_ALL=C sort)"
+
     while IFS= read -r name; do
       [[ -z "$name" ]] && continue
       local rel
@@ -1664,7 +1689,7 @@ collect_files_for_directory() {
       fi
 
       current_group_files+=("$rel")
-    done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort)
+    done <<< "$sorted_blob"
   fi
 }
 
@@ -1693,10 +1718,13 @@ collect_subdirs_for_directory() {
 
   local name
   if (( ${#names[@]} > 0 )); then
+    local sorted_blob
+    sorted_blob="$(printf '%s\n' "${names[@]}" | LC_ALL=C sort)"
+
     while IFS= read -r name; do
       [[ -z "$name" ]] && continue
       current_subdirs+=("$name")
-    done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort)
+    done <<< "$sorted_blob"
   fi
 }
 

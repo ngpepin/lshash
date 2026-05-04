@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_PATH="$SCRIPT_DIR/LsHash.csproj"
 RID="${1:-linux-x64}"
 CONFIGURATION="${CONFIGURATION:-Release}"
+FRAMEWORK="${FRAMEWORK:-net10.0}"
 OUTPUT_DIR="$SCRIPT_DIR/dist/$RID"
 
 if ! command -v dotnet >/dev/null 2>&1; then
@@ -15,6 +16,7 @@ fi
 
 dotnet publish "$PROJECT_PATH" \
   -c "$CONFIGURATION" \
+  -f "$FRAMEWORK" \
   -r "$RID" \
   --self-contained true \
   -p:PublishSingleFile=true \

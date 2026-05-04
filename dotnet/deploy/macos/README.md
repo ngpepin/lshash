@@ -1,6 +1,8 @@
 # macOS Docker Deployment (.NET)
 
-This directory contains a Docker-based deployment path for running the .NET lshash implementation on macOS, including Catalina (10.15), where native .NET 10 self-contained binaries may not run directly.
+This directory contains a Docker-based deployment path for running the .NET lshash implementation on macOS.
+
+Note: native macOS builds produced by `dotnet/build-macos.sh` now default to `net6.0` for Catalina-friendly compatibility. Use this Docker path when you prefer containerized execution.
 
 ## Files
 

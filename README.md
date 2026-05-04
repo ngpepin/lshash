@@ -70,6 +70,7 @@ This separation of discovery and action supports safer change control, clearer g
 - The script now runs on macOS Catalina or later shell/tooling for traversal and sorting behavior.
 - Hash command requirements still apply by algorithm choice. On macOS, `blake3` is typically the easiest path because `b3sum` can be auto-installed when package tooling is available.
 - For non-BLAKE3 algorithms on macOS, the script prefers GNU `*sum` tools when installed, but automatically falls back to native commands where possible (`shasum` for `sha256`/`sha512`/`sha1`, and `md5` for `md5`).
+- On legacy Bash (for example macOS system Bash 3.2), the script relaxes `nounset` (`set +u`) internally to avoid known empty-array expansion failures while preserving other strict-mode protections.
 
 ### BLAKE3 auto-install behavior
 
@@ -117,12 +118,15 @@ cd dotnet
 ./build-macos.sh
 ```
 
+By default, `build-macos.sh` publishes `net6.0` binaries for better macOS Catalina compatibility.
+
 Optional target selection:
 
 ```bash
 cd dotnet
 ./build-macos.sh osx-arm64
 ./build-macos.sh osx-x64
+./build-macos.sh --framework net10.0 osx-arm64
 ```
 
 Output executables:
@@ -132,9 +136,7 @@ Output executables:
 
 ### macOS deployment for .NET implementation
 
-Native .NET 10 self-contained binaries may fail on Catalina or earlier due to runtime/OS compatibility.
-
-Use the Docker deployment bundle instead:
+If you prefer a containerized execution path, use the Docker deployment bundle:
 
 ```bash
 cd dotnet/deploy/macos
@@ -731,6 +733,11 @@ LSHASH_INSTALL_TIMEOUT=5 ./lshash.sh
 ```bash
 cd /home/npepin/Projects/lshash
 ```
+
+### macOS error: `cannot make pipe for process substitution: Too many open files`
+
+- Recent versions of the script avoid high-frequency process substitutions in recursive traversal/sorting paths to prevent file-descriptor exhaustion on legacy macOS Bash.
+- If you still see this, ensure you are running the latest script revision from this repository.
 
 ## FAQ
 

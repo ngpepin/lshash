@@ -60,11 +60,11 @@ internal sealed class Options
 
 internal sealed class FileEntry
 {
-    public required string RelativePath { get; init; }
+    public string RelativePath { get; init; } = string.Empty;
 
-    public required string DirectoryPath { get; init; }
+    public string DirectoryPath { get; init; } = string.Empty;
 
-    public required string BaseName { get; init; }
+    public string BaseName { get; init; } = string.Empty;
 
     public string? Hash { get; init; }
 
@@ -1564,10 +1564,87 @@ internal static class Program
             return false;
         }
 
+#if NET7_0_OR_GREATER
         try
         {
             var mode = File.GetUnixFileMode(filePath);
             return (mode & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0;
+        }
+        catch
+        {
+            // Fall through to the stat-based fallback for resilience across runtimes/filesystems.
+        }
+#endif
+
+        return TryHasAnyExecuteBitViaStat(filePath);
+    }
+
+    private static bool TryHasAnyExecuteBitViaStat(string filePath)
+    {
+        if (!TryGetUnixPermissionModeViaStat(filePath, out var mode))
+        {
+            return false;
+        }
+
+        const int executeMask = 0x49; // octal 0111
+        return (mode & executeMask) != 0;
+    }
+
+    private static bool TryGetUnixPermissionModeViaStat(string filePath, out int mode)
+    {
+        mode = 0;
+
+        if (TryRunStatForMode(filePath, OperatingSystem.IsMacOS() ? "-f" : "-c", out mode))
+        {
+            return true;
+        }
+
+        // Cross-fallback between GNU and BSD stat styles.
+        var fallbackStyle = OperatingSystem.IsMacOS() ? "-c" : "-f";
+        return TryRunStatForMode(filePath, fallbackStyle, out mode);
+    }
+
+    private static bool TryRunStatForMode(string filePath, string styleFlag, out int mode)
+    {
+        mode = 0;
+
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "stat",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+
+            startInfo.ArgumentList.Add(styleFlag);
+            startInfo.ArgumentList.Add(styleFlag == "-f" ? "%Lp" : "%a");
+            startInfo.ArgumentList.Add("--");
+            startInfo.ArgumentList.Add(filePath);
+
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return false;
+            }
+
+            var output = process.StandardOutput.ReadToEnd().Trim();
+            process.WaitForExit();
+            if (process.ExitCode != 0 || output.Length == 0)
+            {
+                return false;
+            }
+
+            var octalDigits = output.Length > 3 ? output[^3..] : output;
+            if (!Regex.IsMatch(octalDigits, "^[0-7]{3}$", RegexOptions.CultureInvariant))
+            {
+                return false;
+            }
+
+            mode = Convert.ToInt32(octalDigits, 8);
+            return true;
         }
         catch
         {
@@ -2109,11 +2186,10 @@ internal static class Program
         var minWorkers = Math.Max(1, Math.Min(startWorkers, endWorkers));
         var maxWorkers = Math.Max(1, Math.Max(startWorkers, endWorkers));
         var workerStep = Math.Max(1, (maxWorkers - minWorkers) / 6);
-        var fsType = TryGetFileSystemTypeForWorkingDirectory();
-        var networkFs = IsNetworkFilesystemType(fsType);
-        var targetChunkCount = networkFs ? 512 : 48;
-        var minChunkSize = networkFs ? 1 : 64;
-        var maxChunkSize = networkFs ? 32 : 512;
+        // Use the same aggressive/adaptive chunk profile for local and network-mounted drives.
+        var targetChunkCount = 512;
+        var minChunkSize = 1;
+        var maxChunkSize = 32;
         var chunkSize = Math.Clamp((int)Math.Ceiling(totalCount / (double)targetChunkCount), minChunkSize, maxChunkSize);
         var totalChunks = (totalCount + chunkSize - 1) / chunkSize;
 
@@ -2229,28 +2305,14 @@ internal static class Program
         }
 
         var cpu = Math.Max(Environment.ProcessorCount, 1);
-        var fsType = TryGetFileSystemTypeForWorkingDirectory();
-        if (IsNetworkFilesystemType(fsType))
+        var endWorkers = Math.Clamp(cpu * 2, 8, 64);
+        var startWorkers = Math.Clamp(cpu * 4, 24, 192);
+        if (startWorkers < endWorkers)
         {
-            var endWorkers = Math.Clamp(cpu * 2, 8, 64);
-            var startWorkers = Math.Clamp(cpu * 4, 24, 192);
-            if (startWorkers < endWorkers)
-            {
-                startWorkers = endWorkers;
-            }
-
-            CachedHashWorkerPlan = (startWorkers, endWorkers);
-            return CachedHashWorkerPlan.Value;
+            startWorkers = endWorkers;
         }
 
-        var localEnd = Math.Clamp(cpu, 1, 32);
-        var localStart = Math.Clamp(cpu * 2, 4, 64);
-        if (localStart < localEnd)
-        {
-            localStart = localEnd;
-        }
-
-        CachedHashWorkerPlan = (localStart, localEnd);
+        CachedHashWorkerPlan = (startWorkers, endWorkers);
         return CachedHashWorkerPlan.Value;
     }
 
