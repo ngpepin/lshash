@@ -723,10 +723,20 @@ internal static class Program
                     continue;
                 }
 
-                var directoryFiles = GetFilesForDirectory(directory);
-                directoryFiles = directoryFiles
-                    .Where(path => !ShouldExcludePath(path, options.ExcludePatterns))
-                    .ToList();
+                var directoryFiles = new List<string>();
+                foreach (var filePath in GetFilesForDirectory(directory))
+                {
+                    if (ShouldExcludePath(filePath, options.ExcludePatterns))
+                    {
+                        continue;
+                    }
+
+                    var fileIndexStart = Stopwatch.GetTimestamp();
+                    PrintGlobalFileIndexingStartedNotice(filePath, options.Quiet);
+                    var elapsedSeconds = (Stopwatch.GetTimestamp() - fileIndexStart) / (double)Stopwatch.Frequency;
+                    directoryFiles.Add(filePath);
+                    PrintGlobalFileIndexedNotice(filePath, options.Quiet, elapsedSeconds);
+                }
 
                 files.AddRange(directoryFiles);
             }
@@ -739,8 +749,20 @@ internal static class Program
                 return;
             }
 
-            files = GetFilesForDirectory(".");
-            files = files.Where(path => !ShouldExcludePath(path, options.ExcludePatterns)).ToList();
+            files = new List<string>();
+            foreach (var filePath in GetFilesForDirectory("."))
+            {
+                if (ShouldExcludePath(filePath, options.ExcludePatterns))
+                {
+                    continue;
+                }
+
+                var fileIndexStart = Stopwatch.GetTimestamp();
+                PrintGlobalFileIndexingStartedNotice(filePath, options.Quiet);
+                var elapsedSeconds = (Stopwatch.GetTimestamp() - fileIndexStart) / (double)Stopwatch.Frequency;
+                files.Add(filePath);
+                PrintGlobalFileIndexedNotice(filePath, options.Quiet, elapsedSeconds);
+            }
         }
 
         summaryStats.TotalFilesScanned += files.Count;
@@ -1133,6 +1155,42 @@ internal static class Program
         var maxNameLen = Math.Max(directory.Length, 1);
         var displayName = FormatNameField(directory, DedupeExcludedDirectoryMessage, consoleWidth, maxNameLen, italicize: false);
         Console.WriteLine($"{displayName}{DedupeExcludedDirectoryMessage}");
+    }
+
+    private static void PrintGlobalFileIndexedNotice(string file, bool quiet, double elapsedSeconds)
+    {
+        if (quiet)
+        {
+            return;
+        }
+
+        var elapsedText = elapsedSeconds.ToString("F3", CultureInfo.InvariantCulture);
+        var displayHash = $"Completed ({elapsedText}s)";
+        var consoleWidth = GetConsoleWidth();
+        var maxNameLen = Math.Max(file.Length, 24);
+        var displayName = FormatNameField(file, displayHash, consoleWidth, maxNameLen, italicize: false);
+
+        if (Console.IsOutputRedirected)
+        {
+            Console.WriteLine($"{displayName}{displayHash}");
+            return;
+        }
+
+        Console.Write($"\r{displayName}{displayHash}\u001b[K\n");
+    }
+
+    private static void PrintGlobalFileIndexingStartedNotice(string file, bool quiet)
+    {
+        if (quiet || Console.IsOutputRedirected)
+        {
+            return;
+        }
+
+        const string displayHash = "Indexing...";
+        var consoleWidth = GetConsoleWidth();
+        var maxNameLen = Math.Max(file.Length, 24);
+        var displayName = FormatNameField(file, displayHash, consoleWidth, maxNameLen, italicize: false);
+        Console.Write($"\r{displayName}{displayHash}\u001b[K");
     }
 
     private static List<string> GetFilesForDirectory(string directory)

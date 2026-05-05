@@ -93,6 +93,15 @@ normalize_case_root() {
   mv "$tmp" "$file"
 }
 
+normalize_index_timing() {
+  local file="$1"
+  local tmp
+
+  tmp="$(mktemp)"
+  sed -E 's/Completed \([0-9]+\.[0-9]{3}s\)/Completed (<elapsed>)/g' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
 run_impl() {
   local work_dir="$1"
   local out_file="$2"
@@ -129,6 +138,8 @@ run_pair() {
 
   normalize_case_root "$tmpdir/bash.clean" "$bash_case"
   normalize_case_root "$tmpdir/dotnet.clean" "$dotnet_case"
+  normalize_index_timing "$tmpdir/bash.clean"
+  normalize_index_timing "$tmpdir/dotnet.clean"
 
   assert_same_output "$tmpdir/bash.clean" "$tmpdir/dotnet.clean" "$scenario_name: bash/.NET outputs differ"
 
@@ -415,7 +426,7 @@ main() {
 
   case_dir="$(run_pair "global non-rec behaves all-directory" setup_all_directory_non_adjacent --algorithm=sha256 -d shorter --global)"
   assert_contains "$case_dir/bash.clean" "z-sync-conflict.txt (moved to .dups/)" "--global with -d should dedupe non-adjacent duplicates in non-recursive mode"
-  assert_occurrences "$case_dir/bash.clean" "z-sync-conflict.txt" "2" "--global non-recursive should list duplicate during hashing and re-list it after move"
+  assert_occurrences "$case_dir/bash.clean" "z-sync-conflict.txt" "3" "--global non-recursive should list duplicate during indexing and hashing, then re-list it after move"
   assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/.dups" "--global non-recursive should list .dups directories"
   assert_order "$case_dir/bash.clean" "Summary: scanned" "<CASE_ROOT>/.dups" ".dups directories should be listed after summary for non-recursive --global"
   [[ -f "$case_dir/bashcase/.dups/z-sync-conflict.txt" ]] || { echo "Assertion failed: bash --global non-recursive should move duplicate" >&2; exit 1; }
@@ -432,8 +443,9 @@ main() {
   rm -rf "$case_dir"
 
   case_dir="$(run_pair "global recursive cross-directory" setup_global_recursive_cross_directory --algorithm=sha256 -r -d shorter --global)"
+  assert_occurrences "$case_dir/bash.clean" "Completed" "3" "--global recursive should print one Completed indexing notice per indexed file"
   assert_contains "$case_dir/bash.clean" "sub/this_is_a_significantly_longer_duplicate_filename.txt (moved to .dups/)" "--global recursive should dedupe across directories and move loser in-place"
-  assert_occurrences "$case_dir/bash.clean" "sub/this_is_a_significantly_longer_duplicate_filename.txt" "2" "--global recursive should list duplicate during hashing and re-list it after move"
+  assert_occurrences "$case_dir/bash.clean" "sub/this_is_a_significantly_longer_duplicate_filename.txt" "3" "--global recursive should list duplicate during indexing and hashing, then re-list it after move"
   assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/sub/.dups" "--global recursive should list all .dups directories"
   assert_order "$case_dir/bash.clean" "Summary: scanned" "<CASE_ROOT>/sub/.dups" ".dups directories should be listed after summary for recursive --global"
   [[ -f "$case_dir/bashcase/sub/.dups/this_is_a_significantly_longer_duplicate_filename.txt" ]] || { echo "Assertion failed: bash --global recursive should move duplicate into source directory .dups" >&2; exit 1; }
@@ -458,6 +470,7 @@ main() {
 
   case_dir="$(run_pair "global recursive quiet hides exclude notice" setup_dedupe_recursive_excluded_branch --algorithm=sha256 -r -d shorter --global -q)"
   assert_not_contains "$case_dir/bash.clean" "<excluded: directory and children ignored due to .lshash-exclude>" "-q should suppress exclude directory notices"
+  assert_not_contains "$case_dir/bash.clean" "Completed" "-q should suppress global per-file indexing progress notices"
   [[ -f "$case_dir/bashcase/skip/dup.txt" ]] || { echo "Assertion failed: bash excluded file should remain in place in quiet mode" >&2; exit 1; }
   [[ -f "$case_dir/dotnetcase/skip/dup.txt" ]] || { echo "Assertion failed: dotnet excluded file should remain in place in quiet mode" >&2; exit 1; }
   rm -rf "$case_dir"

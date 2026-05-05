@@ -553,6 +553,7 @@ Program.cs
 
 [metadataReferences]
 <NUGET>/
+ blake3/0.6.1/lib/net6.0/Blake3.dll
  bouncycastle.cryptography/2.4.0/lib/net6.0/BouncyCastle.Cryptography.dll
  microsoft.netcore.app.ref/6.0.36/ref/net6.0/
   Microsoft.CSharp.dll
