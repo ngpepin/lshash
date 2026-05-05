@@ -77,6 +77,17 @@ assert_order() {
   fi
 }
 
+assert_contains_regex() {
+  local file="$1"
+  local regex="$2"
+  local message="$3"
+  if ! grep -Eq -- "$regex" "$file"; then
+    echo "Assertion failed: $message" >&2
+    echo "Expected regex match: $regex" >&2
+    exit 1
+  fi
+}
+
 ensure_dotnet_binary() {
   (cd "$ROOT_DIR/dotnet" && ./build.sh linux-x64 >/dev/null)
 }
@@ -425,6 +436,8 @@ main() {
   rm -rf "$case_dir"
 
   case_dir="$(run_pair "global non-rec behaves all-directory" setup_all_directory_non_adjacent --algorithm=sha256 -d shorter --global)"
+  assert_contains "$case_dir/bash.clean" "Indexing complete; starting hashing" "--global should report when indexing has completed and hashing begins"
+  assert_contains_regex "$case_dir/bash.clean" '^a-copy\.txt.*a6328afc76e9db71da297ebff4b0d3e7a7eb3b01d917c05a6573fef121b6ecb6$' "--global hashing output should include file path with hash in second column"
   assert_contains "$case_dir/bash.clean" "z-sync-conflict.txt (moved to .dups/)" "--global with -d should dedupe non-adjacent duplicates in non-recursive mode"
   assert_occurrences "$case_dir/bash.clean" "z-sync-conflict.txt" "3" "--global non-recursive should list duplicate during indexing and hashing, then re-list it after move"
   assert_contains "$case_dir/bash.clean" "<CASE_ROOT>/.dups" "--global non-recursive should list .dups directories"
@@ -471,6 +484,7 @@ main() {
   case_dir="$(run_pair "global recursive quiet hides exclude notice" setup_dedupe_recursive_excluded_branch --algorithm=sha256 -r -d shorter --global -q)"
   assert_not_contains "$case_dir/bash.clean" "<excluded: directory and children ignored due to .lshash-exclude>" "-q should suppress exclude directory notices"
   assert_not_contains "$case_dir/bash.clean" "Completed" "-q should suppress global per-file indexing progress notices"
+  assert_not_contains "$case_dir/bash.clean" "Indexing complete; starting hashing" "-q should suppress global indexing phase notices"
   [[ -f "$case_dir/bashcase/skip/dup.txt" ]] || { echo "Assertion failed: bash excluded file should remain in place in quiet mode" >&2; exit 1; }
   [[ -f "$case_dir/dotnetcase/skip/dup.txt" ]] || { echo "Assertion failed: dotnet excluded file should remain in place in quiet mode" >&2; exit 1; }
   rm -rf "$case_dir"

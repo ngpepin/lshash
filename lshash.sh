@@ -481,36 +481,11 @@ print_dedupe_excluded_directory_notice() {
   printf '%s%s\n' "$display_name" "$display_hash"
 }
 
-current_time_millis() {
-  if [[ -n "${EPOCHREALTIME:-}" ]]; then
-    local whole_seconds="${EPOCHREALTIME%.*}"
-    local fractional="${EPOCHREALTIME#*.}"
-    fractional="${fractional}000"
-    local millis="${fractional:0:3}"
-    printf '%s\n' "$((10#$whole_seconds * 1000 + 10#$millis))"
-    return
-  fi
-
-  printf '%s\n' "$((SECONDS * 1000))"
-}
-
-format_elapsed_seconds_3dp() {
-  local elapsed_ms="$1"
-  if (( elapsed_ms < 0 )); then
-    elapsed_ms=0
-  fi
-
-  local whole_seconds=$((elapsed_ms / 1000))
-  local millis=$((elapsed_ms % 1000))
-  printf '%d.%03d' "$whole_seconds" "$millis"
-}
-
 print_global_file_indexing_completed_notice() {
   local file_rel="$1"
-  local elapsed_seconds="$2"
   [[ "$quiet" == "true" ]] && return
 
-  local display_hash="Completed (${elapsed_seconds}s)"
+  local display_hash="Completed"
   local fallback_width=${#file_rel}
   if (( fallback_width < 24 )); then
     fallback_width=24
@@ -539,6 +514,25 @@ print_global_file_indexing_started_notice() {
   local display_name
   display_name="$(format_name_field "$file_rel" "$display_hash" "$fallback_width" "false")"
   printf '\r%s%s\033[K' "$display_name" "$display_hash"
+}
+
+print_global_phase_notice() {
+  local message="$1"
+  [[ "$quiet" == "true" ]] && return
+
+  local label="[global]"
+  local fallback_width=${#label}
+  if (( fallback_width < 24 )); then
+    fallback_width=24
+  fi
+
+  local display_name
+  display_name="$(format_name_field "$label" "$message" "$fallback_width" "false")"
+  if [[ "$global_index_progress_interactive" == "true" ]]; then
+    printf '\r%s%s\033[K\n' "$display_name" "$message"
+  else
+    printf '%s%s\n' "$display_name" "$message"
+  fi
 }
 
 warn_file_issue() {
@@ -1870,10 +1864,6 @@ collect_files_for_directory() {
     while IFS= read -r name; do
       [[ -z "$name" ]] && continue
       local rel
-      local index_start_ms=""
-      local index_end_ms
-      local index_elapsed_ms
-      local index_elapsed_seconds
       if [[ "$dir_rel" == "." ]]; then
         rel="$name"
       else
@@ -1885,16 +1875,12 @@ collect_files_for_directory() {
       fi
 
       if [[ "$global_index_progress_active" == "true" ]]; then
-        index_start_ms="$(current_time_millis)"
         print_global_file_indexing_started_notice "$rel"
       fi
 
       current_group_files+=("$rel")
       if [[ "$global_index_progress_active" == "true" ]]; then
-        index_end_ms="$(current_time_millis)"
-        index_elapsed_ms=$((index_end_ms - index_start_ms))
-        index_elapsed_seconds="$(format_elapsed_seconds_3dp "$index_elapsed_ms")"
-        print_global_file_indexing_completed_notice "$rel" "$index_elapsed_seconds"
+        print_global_file_indexing_completed_notice "$rel"
       fi
     done <<< "$sorted_blob"
   fi
@@ -2127,10 +2113,12 @@ if [[ "$dedupe_enabled" == "true" && "$global_dedupe" == "true" ]]; then
   if [[ "$recursive" == "true" ]]; then
     global_scope_active="true"
     collect_files_for_global_scope
+    print_global_phase_notice "Indexing complete; starting hashing"
     process_directory_files "."
     global_scope_active="false"
   else
     collect_files_for_directory "."
+    print_global_phase_notice "Indexing complete; starting hashing"
     process_directory_files "."
   fi
   global_index_progress_active="false"

@@ -731,11 +731,9 @@ internal static class Program
                         continue;
                     }
 
-                    var fileIndexStart = Stopwatch.GetTimestamp();
                     PrintGlobalFileIndexingStartedNotice(filePath, options.Quiet);
-                    var elapsedSeconds = (Stopwatch.GetTimestamp() - fileIndexStart) / (double)Stopwatch.Frequency;
                     directoryFiles.Add(filePath);
-                    PrintGlobalFileIndexedNotice(filePath, options.Quiet, elapsedSeconds);
+                    PrintGlobalFileIndexedNotice(filePath, options.Quiet);
                 }
 
                 files.AddRange(directoryFiles);
@@ -757,11 +755,9 @@ internal static class Program
                     continue;
                 }
 
-                var fileIndexStart = Stopwatch.GetTimestamp();
                 PrintGlobalFileIndexingStartedNotice(filePath, options.Quiet);
-                var elapsedSeconds = (Stopwatch.GetTimestamp() - fileIndexStart) / (double)Stopwatch.Frequency;
                 files.Add(filePath);
-                PrintGlobalFileIndexedNotice(filePath, options.Quiet, elapsedSeconds);
+                PrintGlobalFileIndexedNotice(filePath, options.Quiet);
             }
         }
 
@@ -770,6 +766,8 @@ internal static class Program
         {
             return;
         }
+
+        PrintGlobalPhaseNotice("Indexing complete; starting hashing", options.Quiet);
 
         if (options.Recursive && diagnostics.Enabled)
         {
@@ -1157,15 +1155,14 @@ internal static class Program
         Console.WriteLine($"{displayName}{DedupeExcludedDirectoryMessage}");
     }
 
-    private static void PrintGlobalFileIndexedNotice(string file, bool quiet, double elapsedSeconds)
+    private static void PrintGlobalFileIndexedNotice(string file, bool quiet)
     {
         if (quiet)
         {
             return;
         }
 
-        var elapsedText = elapsedSeconds.ToString("F3", CultureInfo.InvariantCulture);
-        var displayHash = $"Completed ({elapsedText}s)";
+        const string displayHash = "Completed";
         var consoleWidth = GetConsoleWidth();
         var maxNameLen = Math.Max(file.Length, 24);
         var displayName = FormatNameField(file, displayHash, consoleWidth, maxNameLen, italicize: false);
@@ -1191,6 +1188,27 @@ internal static class Program
         var maxNameLen = Math.Max(file.Length, 24);
         var displayName = FormatNameField(file, displayHash, consoleWidth, maxNameLen, italicize: false);
         Console.Write($"\r{displayName}{displayHash}\u001b[K");
+    }
+
+    private static void PrintGlobalPhaseNotice(string message, bool quiet)
+    {
+        if (quiet)
+        {
+            return;
+        }
+
+        const string label = "[global]";
+        var consoleWidth = GetConsoleWidth();
+        var maxNameLen = Math.Max(label.Length, 24);
+        var displayName = FormatNameField(label, message, consoleWidth, maxNameLen, italicize: false);
+
+        if (Console.IsOutputRedirected)
+        {
+            Console.WriteLine($"{displayName}{message}");
+            return;
+        }
+
+        Console.Write($"\n\r{displayName}{message}\u001b[K\n");
     }
 
     private static List<string> GetFilesForDirectory(string directory)
